@@ -4,9 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
-#include <iomanip>
+#include <cstring>
 #include <random>
-#include <sstream>
 #include <vector>
 #include "common/archives.h"
 #include "common/common_types.h"
@@ -132,126 +131,103 @@ void Module::Interface::GetWifiStatus(Kernel::HLERequestContext& ctx) {
     rb.Push<u32>(static_cast<u32>(WifiStatus::STATUS_CONNECTED_SLOT1));
 }
 
-// ---------------------------------------------------------------------------
-// AP entry layout (each entry is 0x34 bytes):
-//   0x00  u32     SSID length
-//   0x04  u8[32]  SSID (UTF-8, zero-padded to fill field)
-//   0x24  u8[6]   MAC address
-//   0x2A  u8[2]   padding (0x00)
-//   0x2C  s16     signal strength
-//   0x2E  u8      signal strength summary (0-3)
-//   0x2F  u8      channel
-//   0x30  u16     security type
-//   0x32  u8[2]   padding (0x00)
-// ---------------------------------------------------------------------------
-static std::pair<u8, std::vector<u8>> GenerateRandomAPs() {
-    // Seed a Mersenne Twister from a real entropy source so every call
-    // produces a different set of networks.
-    std::mt19937 rng{std::random_device{}()};
-
-    auto rand_u8  = [&](u8  lo, u8  hi) -> u8  { return static_cast<u8> (std::uniform_int_distribution<int>(lo, hi)(rng)); };
-    auto rand_u16 = [&](u16 lo, u16 hi) -> u16 { return static_cast<u16>(std::uniform_int_distribution<int>(lo, hi)(rng)); };
-    auto rand_s16 = [&](s16 lo, s16 hi) -> s16 { return static_cast<s16>(std::uniform_int_distribution<int>(lo, hi)(rng)); };
-
-    // Plausible SSID prefixes; a random 4-hex-digit suffix is appended.
-    static const std::vector<std::string> kSSIDPrefixes = {
-        "NETGEAR-", "ASUS_",    "Linksys",   "TP-Link_", "XFINITY",
-        "Spectrum", "ATT-WiFi", "Verizon-",  "HomeNet",  "MyWiFi-",
-        "CoxWifi",  "Optimum",  "BELL_",     "BT-Hub",   "SKY_WiFi",
-    };
-
-    // Security type values as specified in acDataDoc.md
-    static const std::array<u16, 6> kSecTypes = {
-        0x0000, // No security
-        0x0101, // WEP
-        0x0202, // WPA-PSK  (TKIP)
-        0x0303, // WPA-PSK  (AES)
-        0x0404, // WPA2-PSK (TKIP)
-        0x0505, // WPA2-PSK (AES)
-    };
-
-    // Realistic non-overlapping 2.4 GHz channel choices
-    static const std::array<u8, 3> kChannels = {1, 6, 11};
-
-    constexpr std::size_t ENTRY_SIZE  = 0x34;
-    constexpr std::size_t SSID_FIELD  = 32; // fixed field width in the struct
-
-    const u8 num_entries = rand_u8(3, 8);
-    std::vector<u8> buffer(num_entries * ENTRY_SIZE, 0x00);
-
-    for (u8 i = 0; i < num_entries; ++i) {
-        u8* e = buffer.data() + i * ENTRY_SIZE;
-
-        // --- SSID (0x00 + 0x04) -------------------------------------------
-        // Pick a prefix and append a random 4-hex-digit suffix.
-        std::string prefix = kSSIDPrefixes[rand_u8(0, static_cast<u8>(kSSIDPrefixes.size() - 1))];
-        std::ostringstream oss;
-        oss << prefix
-            << std::hex << std::uppercase
-            << std::setw(4) << std::setfill('0') << rand_u16(0, 0xFFFF);
-        std::string ssid = oss.str().substr(0, SSID_FIELD); // cap at 32 bytes
-
-        const u32 ssid_len = static_cast<u32>(ssid.size());
-        std::memcpy(e + 0x00, &ssid_len, sizeof(ssid_len));
-        std::memcpy(e + 0x04, ssid.data(), ssid_len);
-        // remaining SSID bytes already 0x00 from vector initialisation
-
-        // --- MAC address (0x24) -------------------------------------------
-        // Locally-administered unicast: bit 1 of byte 0 set, bit 0 cleared.
-        for (int b = 0; b < 6; ++b)
-            e[0x24 + b] = rand_u8(0x00, 0xFF);
-        e[0x24] = (e[0x24] & 0xFE) | 0x02;
-
-        // --- Signal strength (0x2C) + summary (0x2E) ----------------------
-        const s16 signal = rand_s16(1, 80);
-        std::memcpy(e + 0x2C, &signal, sizeof(signal));
-
-        u8 summary;
-        if      (signal >= 60) summary = 3;
-        else if (signal >= 30) summary = 2;
-        else if (signal >= 15) summary = 1;
-        else                   summary = 0;
-        e[0x2E] = summary;
-
-        // --- Channel (0x2F) -----------------------------------------------
-        e[0x2F] = kChannels[rand_u8(0, static_cast<u8>(kChannels.size() - 1))];
-
-        // --- Security type (0x30) -----------------------------------------
-        const u16 sec = kSecTypes[rand_u8(0, static_cast<u8>(kSecTypes.size() - 1))];
-        std::memcpy(e + 0x30, &sec, sizeof(sec));
-        // bytes 0x32-0x33 remain 0x00 (padding)
-    }
-
-    return {num_entries, std::move(buffer)};
-}
-
 void Module::Interface::ScanAPs(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
-    const u32 max_size = rp.Pop<u32>();
+    u32 size = rp.Pop<u32>();
+    std::vector<u8> buffer(size, 0x00);
 
-    // Both the data generation and the IPC reply MUST live inside the
-    // completion callback — RunAsync is asynchronous and the context is
-    // not ready for a response until the second lambda fires.
     ctx.RunAsync(
         [](Kernel::HLERequestContext&) -> s64 {
-            // Simulate a 1-second scan delay to satisfy Nintendo.
             return std::chrono::duration_cast<std::chrono::nanoseconds>(
                        std::chrono::seconds(1)).count();
         },
-        [max_size](Kernel::HLERequestContext& ctx) -> void {
-            auto [num_entries, buffer] = GenerateRandomAPs();
+        [](Kernel::HLERequestContext&) -> void {}
+    ); // simulate a 1-second wait to satisfy Nintendo
 
-            // Clamp to what the caller actually allocated.
-            const u32 used = std::min(static_cast<u32>(buffer.size()), max_size);
-            buffer.resize(used);
-            const u8 clamped_entries = static_cast<u8>(used / 0x34);
+    // --- seed RNG from hardware entropy ---
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(0, 255);
 
-            IPC::RequestBuilder rb(ctx, 0x001D, 2, 2);
-            rb.Push(ResultSuccess);
-            rb.Push<u32>(clamped_entries);
-            rb.PushStaticBuffer(std::move(buffer), 0);
-        }
-    );
+    // AP entry size is 0x34 bytes. Generate between 3 and 6 entries.
+    constexpr u32 ENTRY_SIZE = 0x34;
+    const u8 num_entries = static_cast<u8>(3 + (rng() % 4)); // 3-6
+    const u32 data_size = num_entries * ENTRY_SIZE;
+
+    if (data_size > size) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
+        rb.Push(ResultSuccess);
+        rb.Push<u32>(0);
+        rb.PushStaticBuffer(std::move(buffer), 0);
+        return;
+    }
+
+    // Security type table from acDataDoc.md
+    static const u16 kSecTypes[] = {
+        0x0000, // No security
+        0x0101, // WEP
+        0x0202, // WPA-PSK (TKIP)
+        0x0303, // WPA-PSK (AES)
+        0x0404, // WPA2-PSK (TKIP)
+        0x0505, // WPA2-PSK (AES)
+    };
+    // Standard non-overlapping 2.4GHz channels
+    static const u8 kChannels[] = {1, 6, 11};
+
+    // Simple SSID pool — realistic enough to not confuse the game
+    static const char* kSSIDs[] = {
+        "NETGEAR",  "ASUS",     "Linksys",  "TP-Link",
+        "XFINITY",  "Spectrum", "HomeNet",  "ATT-WiFi",
+        "Verizon",  "MyWiFi",   "CoxWifi",  "Optimum",
+    };
+
+    for (u8 i = 0; i < num_entries; ++i) {
+        u8* e = buffer.data() + i * ENTRY_SIZE;
+        // All bytes are already 0x00 from buffer initialisation.
+
+        // 0x00 — SSID length (u32 LE)
+        const char* ssid_str = kSSIDs[rng() % 12];
+        const u32 ssid_len = static_cast<u32>(std::strlen(ssid_str));
+        e[0x00] = static_cast<u8>(ssid_len);
+        e[0x01] = 0; e[0x02] = 0; e[0x03] = 0;
+
+        // 0x04 — SSID (32 bytes, zero-padded)
+        std::memcpy(e + 0x04, ssid_str, ssid_len);
+
+        // 0x24 — MAC address (6 bytes, locally-administered unicast)
+        for (int b = 0; b < 6; ++b)
+            e[0x24 + b] = static_cast<u8>(dist(rng));
+        e[0x24] = (e[0x24] & 0xFE) | 0x02; // locally administered, unicast
+
+        // 0x2A — padding (already 0x00)
+
+        // 0x2C — signal strength (s16 LE), range 1-80
+        const s16 signal = static_cast<s16>(1 + (rng() % 80));
+        e[0x2C] = static_cast<u8>(signal & 0xFF);
+        e[0x2D] = static_cast<u8>((signal >> 8) & 0xFF);
+
+        // 0x2E — signal strength summary (0-3)
+        if      (signal >= 60) e[0x2E] = 3;
+        else if (signal >= 30) e[0x2E] = 2;
+        else if (signal >= 15) e[0x2E] = 1;
+        else                   e[0x2E] = 0;
+
+        // 0x2F — channel
+        e[0x2F] = kChannels[rng() % 3];
+
+        // 0x30 — security type (u16 LE)
+        const u16 sec = kSecTypes[rng() % 6];
+        e[0x30] = static_cast<u8>(sec & 0xFF);
+        e[0x31] = static_cast<u8>((sec >> 8) & 0xFF);
+
+        // 0x32 — padding (already 0x00)
+    }
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
+    rb.Push(ResultSuccess);
+    rb.Push<u32>(num_entries);
+    rb.PushStaticBuffer(std::move(buffer), 0);
+
+    LOG_DEBUG(Service_AC, "ScanAPs returning {} randomized entries", num_entries);
 }
 
 void Module::Interface::GetInfraPriority(Kernel::HLERequestContext& ctx) {
