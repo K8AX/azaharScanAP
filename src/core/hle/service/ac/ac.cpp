@@ -3,6 +3,11 @@
 // Refer to the license.txt file included.
 
 #include <vector>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+#include <random>
+#include <cstdint>
 #include "common/archives.h"
 #include "common/common_types.h"
 #include "common/logging/log.h"
