@@ -96,6 +96,18 @@ public:
         void GetStatus(Kernel::HLERequestContext& ctx);
 
         /**
+         * AC::ScanAPs service function
+         *  Inputs:
+         *      1 : Output buffer max size
+         *      64 : Output buffer size << 14 | 2
+         *      65 : Pointer to output AP entry buffer
+         *  Outputs:
+         *      1 : Result of function, 0 on success, otherwise error code
+         *      2 : Number of AP entries written
+         */
+        void ScanAPs(Kernel::HLERequestContext& ctx);
+
+        /**
          * AC::GetWifiStatus service function
          *  Outputs:
          *      1 : Result of function, 0 on success, otherwise error code
