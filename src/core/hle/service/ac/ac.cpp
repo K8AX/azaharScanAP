@@ -3,10 +3,13 @@
 // Refer to the license.txt file included.
 
 #include <vector>
+#include <random>
+#include <cstdint>
 #include "common/archives.h"
 #include "common/common_types.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "common/file_util.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
 #include "core/hle/ipc_helpers.h"
