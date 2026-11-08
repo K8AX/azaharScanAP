@@ -1,6 +1,6 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 package org.citra.citra_emu.adapters
 
@@ -53,6 +53,8 @@ import org.citra.citra_emu.adapters.GameAdapter.GameViewHolder
 import org.citra.citra_emu.databinding.CardGameBinding
 import org.citra.citra_emu.databinding.DialogShortcutBinding
 import org.citra.citra_emu.features.cheats.ui.CheatsFragmentDirections
+import org.citra.citra_emu.features.settings.ui.SettingsActivity
+import org.citra.citra_emu.features.settings.utils.SettingsFile
 import org.citra.citra_emu.fragments.IndeterminateProgressDialogFragment
 import org.citra.citra_emu.model.Game
 import org.citra.citra_emu.utils.BuildUtil
@@ -200,20 +202,24 @@ class GameAdapter(
             binding.imageGameScreen.scaleType = ImageView.ScaleType.CENTER_CROP
             GameIconUtils.loadGameIcon(activity, game, binding.imageGameScreen)
 
-            binding.textGameTitle.visibility = if (game.title.isEmpty()) {
-                View.GONE
-            } else {
-                View.VISIBLE
-            }
             binding.textCompany.visibility = if (game.company.isEmpty()) {
                 View.GONE
             } else {
                 View.VISIBLE
             }
+            binding.textGameRegion.visibility = if (game.regions.isEmpty()) {
+                View.GONE
+            } else {
+                View.VISIBLE
+            }
 
-            binding.textGameTitle.text = game.title
+            binding.textGameTitle.text = if (game.fileType == "unknown") {
+                CitraApplication.appContext.getString(R.string.invalid_rom)
+            } else {
+                game.title
+            }
             binding.textCompany.text = game.company
-            binding.textGameRegion.text = game.regions
+            binding.textGameRegion.text = translateRegions(game.regions)
             binding.imageCartridge.visibility =
                 if (preferences.getString("insertedCartridge", "") != game.path) {
                     View.GONE
@@ -435,6 +441,51 @@ class GameAdapter(
         popup.show()
     }
 
+    private fun translateRegions(regionsString: String): String {
+        val regions = regionsString.split("|")
+
+        var final = ""
+
+        regions.forEach {
+            var res: Int = -1
+
+            when (it) {
+                "Japan" -> res = R.string.japan
+
+                "North America" -> res = R.string.north_america
+
+                "Europe" -> res = R.string.europe
+
+                "Australia" -> res = R.string.australia
+
+                "China" -> res = R.string.china
+
+                "Korea" -> res = R.string.korea
+
+                "Taiwan" -> res = R.string.taiwan
+
+                "Region free" -> res = R.string.region_free
+
+                "Invalid region" -> res = R.string.invalid_region
+
+                "" -> res = R.string.invalid_region
+
+                else -> {
+                    Log.error("[GameAdapter] Unrecognized region string \"$it\"")
+                    res = R.string.region_get_error
+                }
+            }
+
+            final += CitraApplication.appContext.getString(res) + "|"
+        }
+
+        final = final
+            .dropLast(1) // Remove trailing seperator
+            .replace("|", ", ")
+
+        return final
+    }
+
     private fun showAboutGameDialog(
         context: Context,
         game: Game,
@@ -451,7 +502,8 @@ class GameAdapter(
 
         bottomSheetView.findViewById<TextView>(R.id.about_game_title).text = game.title
         bottomSheetView.findViewById<TextView>(R.id.about_game_company).text = game.company
-        bottomSheetView.findViewById<TextView>(R.id.about_game_region).text = game.regions
+        bottomSheetView.findViewById<TextView>(R.id.about_game_region).text =
+            context.getString(R.string.game_context_region) + " " + translateRegions(game.regions)
         bottomSheetView.findViewById<TextView>(R.id.about_game_id).text =
             context.getString(R.string.game_context_id) + " " + String.format("%016X", game.titleId)
         bottomSheetView.findViewById<TextView>(R.id.about_game_filename).text =
@@ -500,8 +552,11 @@ class GameAdapter(
                     else -> "${seconds}s"
                 }
 
-                append("Playtime: ")
-                append(readablePlayTime)
+                append(
+                    context.getString(R.string.game_context_playtime) +
+                        " " +
+                        readablePlayTime
+                )
             }
 
         bottomSheetView.findViewById<MaterialButton>(R.id.game_shortcut).setOnClickListener {
@@ -578,6 +633,16 @@ class GameAdapter(
         bottomSheetView.findViewById<MaterialButton>(R.id.cheats).setOnClickListener {
             val action = CheatsFragmentDirections.actionGlobalCheatsFragment(holder.game.titleId)
             view.findNavController().navigate(action)
+            bottomSheetDialog.dismiss()
+        }
+
+        bottomSheetView.findViewById<MaterialButton>(R.id.application_settings).setOnClickListener {
+            SettingsActivity.launch(
+                context,
+                SettingsFile.FILE_NAME_CONFIG,
+                String.format("%016X", holder.game.titleId),
+                holder.game.title
+            )
             bottomSheetDialog.dismiss()
         }
 

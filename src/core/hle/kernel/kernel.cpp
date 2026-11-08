@@ -1,6 +1,6 @@
 // Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <boost/serialization/shared_ptr.hpp>
 #include <boost/serialization/unordered_map.hpp>
@@ -139,8 +139,16 @@ const SharedPage::Handler& KernelSystem::GetSharedPageHandler() const {
     return *shared_page_handler;
 }
 
+MemoryRef KernelSystem::GetSharedPageMemoryRef(u64 offset) {
+    return MemoryRef(shared_page_handler, offset);
+}
+
 ConfigMem::Handler& KernelSystem::GetConfigMemHandler() {
     return *config_mem_handler;
+}
+
+MemoryRef KernelSystem::GetConfigMemMemoryRef(u64 offset) {
+    return MemoryRef{config_mem_handler, offset};
 }
 
 IPCDebugger::Recorder& KernelSystem::GetIPCRecorder() {
@@ -221,6 +229,9 @@ void KernelSystem::serialize(Archive& ar, const unsigned int) {
     ar&* timer_manager.get();
     ar & next_process_id;
     ar & process_list;
+    if (Archive::is_saving::value) {
+        stored_processes[current_cpu->GetID()] = current_process;
+    }
     ar & current_process;
     // NB: core count checked in 'core'
     for (auto& thread_manager : thread_managers) {
@@ -242,6 +253,10 @@ void KernelSystem::serialize(Archive& ar, const unsigned int) {
         for (auto& process : process_list) {
             process->vm_manager.Unlock();
         }
+        if (stored_processes[current_cpu->GetID()]) {
+            SetCurrentProcess(stored_processes[current_cpu->GetID()]);
+        }
+        timing.SetCurrentTimer(current_cpu->GetID());
     }
 }
 SERIALIZE_IMPL(KernelSystem)

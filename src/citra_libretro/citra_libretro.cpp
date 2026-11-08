@@ -1,6 +1,6 @@
 // Copyright 2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <list>
 #include <numeric>
@@ -37,6 +37,7 @@
 #if CITRA_ARCH(x86_64)
 #include "common/x64/cpu_detect.h"
 #endif
+#include "common/file_util.h"
 #include "common/logging/backend.h"
 #include "common/logging/filter.h"
 #include "common/settings.h"
@@ -61,6 +62,7 @@ public:
     Common::Log::Filter log_filter;
     std::unique_ptr<EmuWindow_LibRetro> emu_window;
     bool game_loaded = false;
+    bool first_run_loop = true;
     struct retro_hw_render_callback hw_render{};
 };
 
@@ -277,6 +279,12 @@ void retro_run() {
     }
 #endif
 
+    // Run only-once operations
+    if (emu_instance->first_run_loop) {
+        emu_instance->first_run_loop = false;
+        Core::System::GetInstance().RegisterCoreLoopThreadId();
+    }
+
     while (!emu_instance->emu_window->HasSubmittedFrame()) {
         auto result = Core::System::GetInstance().RunLoop();
 
@@ -287,6 +295,15 @@ void retro_run() {
             switch (result) {
             case Core::System::ResultStatus::ErrorSystemFiles:
                 msg = "Azahar was unable to locate a 3DS system archive: " + errorContent;
+                break;
+            case Core::System::ResultStatus::ErrorShaderCacheCrash:
+                // There is no way to ask the user, so the emulation continues.
+                msg = "Azahar closed unexpectedly the last time it built the Vulkan shader cache "
+                      "of the current title. "
+                      "If it crashes again, reset the shader cache by deleting the files "
+                      "starting with " +
+                      errorContent + " in the transferable and pipeline folders in " +
+                      FileUtil::GetUserPath(FileUtil::UserPath::ShaderDir) + "vulkan";
                 break;
             default:
                 msg = "Fatal Error encountered (" + std::to_string(static_cast<int>(result)) +
@@ -487,6 +504,7 @@ void retro_reset() {
     LOG_DEBUG(Frontend, "retro_reset");
     Core::System::GetInstance().Shutdown();
     emu_instance->game_loaded = do_load_game();
+    emu_instance->first_run_loop = true;
 }
 
 /**
@@ -550,6 +568,7 @@ bool retro_load_game(const struct retro_game_info* info) {
     }
 
     emu_instance->emu_window->UpdateLayout();
+    emu_instance->first_run_loop = true;
 
     switch (Settings::values.graphics_api.GetValue()) {
     case Settings::GraphicsAPI::OpenGL: {

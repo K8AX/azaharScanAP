@@ -1,6 +1,6 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 package org.citra.citra_emu.utils
 
@@ -72,6 +72,7 @@ object GpuDriverHelper {
         val driverZips = driverStoragePath.listFiles()
         val drivers: MutableList<Pair<Uri, GpuDriverMetadata>> =
             driverZips
+                .filter { it.isFile }
                 .mapNotNull {
                     val metadata = getMetadataFromZip(it.inputStream())
                     metadata.name?.let { _ -> Pair(it.uri, metadata) }
@@ -213,6 +214,9 @@ object GpuDriverHelper {
     }
 
     external fun supportsCustomDriverLoading(): Boolean
+
+    // True when the device has Qualcomm's KGSL GPU driver.
+    external fun isAdrenoGpu(): Boolean
 
     // Parse the custom driver metadata to retrieve the name.
     val customDriverData: GpuDriverMetadata

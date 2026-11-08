@@ -1,6 +1,6 @@
 // Copyright 2022-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -164,6 +164,10 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer.GetHandle());
 
     glEnable(GL_BLEND);
+
+    glEnable(GL_MULTISAMPLE);
+    glEnable(GL_SAMPLE_SHADING);
+    glMinSampleShading(1.0f);
 }
 
 RasterizerOpenGL::~RasterizerOpenGL() = default;
@@ -581,9 +585,16 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
         return true;
     }
 
+    const auto draw_rect = fb_helper.DrawRect();
+    if (draw_rect.GetArea() == 0) {
+        return true;
+    }
+
     // Bind the framebuffer surfaces
     if (shadow_rendering) {
         state.image_shadow_buffer = framebuffer->Attachment(SurfaceType::Color);
+    } else {
+        state.image_shadow_buffer = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID).Handle();
     }
     state.draw.draw_framebuffer = framebuffer->Handle();
 
@@ -596,7 +607,6 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
 
     // Viewport can have negative offsets or larger dimensions than our framebuffer sub-rect.
     // Enable scissor test to prevent drawing outside of the framebuffer region
-    const auto draw_rect = fb_helper.DrawRect();
     state.scissor.enabled = true;
     state.scissor.x = draw_rect.left;
     state.scissor.y = draw_rect.bottom;
@@ -653,6 +663,22 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
 
             glDrawArrays(GL_TRIANGLES, static_cast<GLint>(offset / sizeof(HardwareVertex)),
                          static_cast<GLsizei>(vertices));
+        }
+    }
+
+    // Resolve after drawing, slow initial approach to ensure the MSAA and non-MSAA buffers are
+    // always in sync
+    if (framebuffer->color_id != VideoCore::SurfaceId{}) {
+        Surface& color_surface = res_cache.GetSurface(framebuffer->color_id);
+        if (color_surface.GetSampleCount() > 1) {
+            runtime.ResolveTexture(color_surface, framebuffer->color_level);
+        }
+    }
+
+    if (framebuffer->depth_id != VideoCore::SurfaceId{}) {
+        Surface& depth_surface = res_cache.GetSurface(framebuffer->depth_id);
+        if (depth_surface.GetSampleCount() > 1) {
+            runtime.ResolveTexture(depth_surface, framebuffer->depth_level);
         }
     }
 
@@ -990,7 +1016,7 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
     }
 
     // Sync the proctex lut
-    if (pica.proctex.lut_dirty) {
+    if (pica.proctex.color_lut_dirty) {
         Common::Vec4f* new_data = reinterpret_cast<Common::Vec4f*>(buffer + bytes_used);
         for (u32 i = 0; i < pica.proctex.color_table.size(); i++) {
             new_data[i] = pica.proctex.color_table[i].ToVector() / 255.0f;
@@ -1002,7 +1028,7 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
     }
 
     // Sync the proctex difference lut
-    if (pica.proctex.diff_lut_dirty) {
+    if (pica.proctex.color_diff_lut_dirty) {
         Common::Vec4f* new_data = reinterpret_cast<Common::Vec4f*>(buffer + bytes_used);
         for (u32 i = 0; i < pica.proctex.color_diff_table.size(); i++) {
             new_data[i] = pica.proctex.color_diff_table[i].ToVector() / 255.0f;
@@ -1019,7 +1045,8 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
 }
 
 void RasterizerOpenGL::UploadUniforms(bool accelerate_draw) {
-    // glBindBufferRange also changes the generic buffer binding point, so we sync the state first.
+    // glBindBufferRange also changes the generic buffer binding point, so we sync the state
+    // first.
     state.draw.uniform_buffer = uniform_buffer.GetHandle();
     state.Apply();
 

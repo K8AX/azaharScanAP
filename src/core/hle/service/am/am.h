@@ -1,6 +1,6 @@
 // Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -8,9 +8,13 @@
 #include <atomic>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/shared_ptr.hpp>
@@ -75,6 +79,7 @@ enum class InstallStatus : u32 {
     ErrorAborted,
     ErrorInvalid,
     ErrorEncrypted,
+    ErrorCannotCheckBundle,
 };
 
 enum class ImportTitleContextState : u8 {
@@ -171,9 +176,14 @@ private:
     ExeFs_Header exefs_header{};
     std::size_t exefs_header_written = 0;
     bool exefs_header_processed = false;
+
+    // The extended header after decryption, used for the NCCH signature check.
+    std::vector<u8> exheader;
+    void RegisterExheader(std::size_t offset, const u8* data, std::size_t length);
 };
 
 class CIAFile;
+class Module;
 void AuthorizeCIAFileDecryption(CIAFile* cia_file, Kernel::HLERequestContext& ctx);
 
 // A file handled returned for CIAs to be written into and subsequently installed.
@@ -192,6 +202,27 @@ public:
         Result result{0};
     };
 
+    /// The result of the host file system work needed before the contents of a title can be
+    /// imported. It is produced by the static Prepare functions, which do not touch any CIAFile
+    /// and can run on any thread, and is then applied to the CIAFile on the emulation thread.
+    struct PreparedTitleMetadata {
+        InstallResult install_result{};
+        FileSys::TitleMetadata tmd;
+        bool is_update = false;
+        std::vector<std::string> content_paths;
+    };
+
+    /// Parses and saves a TMD, and creates the folders and paths for its contents.
+    static PreparedTitleMetadata PrepareTitleMetadata(Service::FS::MediaType media_type,
+                                                      bool is_update, std::span<const u8> tmd_data,
+                                                      std::size_t offset, bool do_signature_checks);
+
+    /// Creates the folders and paths for the contents of an already installed TMD.
+    static PreparedTitleMetadata PrepareAdditionalContent(Service::FS::MediaType media_type,
+                                                          bool is_update,
+                                                          FileSys::TitleMetadata tmd,
+                                                          bool do_signature_checks);
+
     explicit CIAFile(Core::System& system_, Service::FS::MediaType media_type,
                      bool from_cdn = false);
     ~CIAFile();
@@ -199,17 +230,20 @@ public:
     ResultVal<std::size_t> Read(u64 offset, std::size_t length, u8* buffer) const override;
     InstallResult WriteTicket();
     InstallResult WriteTitleMetadata(std::span<const u8> tmd_data, std::size_t offset);
+    InstallResult ApplyTitleMetadata(PreparedTitleMetadata&& prepared);
     ResultVal<std::size_t> WriteContentData(u64 offset, std::size_t length, const u8* buffer);
     ResultVal<std::size_t> Write(u64 offset, std::size_t length, bool flush, bool update_timestamp,
                                  const u8* buffer) override;
 
-    Result PrepareToImportContent(const FileSys::TitleMetadata& tmd);
     Result ProvideTicket(const FileSys::Ticket& ticket);
-    Result ProvideTMDForAdditionalContent(const FileSys::TitleMetadata& tmd);
+    Result ApplyAdditionalContent(PreparedTitleMetadata&& prepared);
     const FileSys::TitleMetadata& GetTMD();
     FileSys::Ticket& GetTicket();
     CIAInstallState GetCiaInstallState() {
         return install_state;
+    }
+    bool IsUpdate() const {
+        return is_update;
     }
 
     ResultVal<std::size_t> WriteContentDataIndexed(u16 content_index, u64 offset,
@@ -235,18 +269,34 @@ public:
 
     void AuthorizeDecryptionFromHLE();
 
+    bool SignatureChecksEnabed() const {
+        return do_signature_checks;
+    }
+
+    Result VerifyContent(u16 content_index);
+
 private:
     friend void AuthorizeCIAFileDecryption(CIAFile* cia_file, Kernel::HLERequestContext& ctx);
+
+    static void PrepareContentPaths(Service::FS::MediaType media_type,
+                                    PreparedTitleMetadata& prepared);
+    Result ApplyContentPreparation(PreparedTitleMetadata&& prepared);
 
     Core::System& system;
 
     // Sections (tik, tmd, contents) are being imported individually
     bool from_cdn;
+
     bool decryption_authorized;
+    bool do_signature_checks = false;
+
     bool is_done = false;
     bool is_closed = false;
     bool is_cancel = false;
     bool is_additional_content = false;
+    bool verification_failed = false;
+    // Whether a TMD was installed by this file, so its title has contents to clean up on abort.
+    bool tmd_installed = false;
 
     // Whether it's installing an update, and what step of installation it is at
     bool is_update = false;
@@ -268,6 +318,8 @@ private:
 
     class DecryptionState;
     std::unique_ptr<DecryptionState> decryption_state;
+    class VerificationState;
+    std::unique_ptr<VerificationState> verification_state;
 };
 
 class CurrentImportingTitle {
@@ -281,6 +333,8 @@ public:
     u64 title_id;
     Service::FS::MediaType media_type;
     bool tmd_provided;
+    // Set while the TMD of this title is being prepared asynchronously.
+    bool tmd_import_pending = false;
 };
 
 // A file handled returned for Tickets to be written into and subsequently installed.
@@ -297,17 +351,19 @@ public:
     bool Close() override;
     void Flush() const override;
 
-    Result Commit();
-    u64 GetTitleID() {
-        return title_id;
+    /// Returns a copy of the ticket data written so far.
+    std::vector<u8> GetData() const {
+        return data;
     }
-    u64 GetTicketID() {
-        return ticket_id;
-    }
+
+    /// Installs a ticket from its data, returning its title id and ticket id.
+    /// With do_signature_checks, it is first verified
+    /// (signature, and console ID for personalized tickets).
+    static ResultVal<std::pair<u64, u64>> Commit(std::span<const u8> ticket_data,
+                                                 bool do_signature_checks);
 
 private:
     u64 written = 0;
-    u64 title_id, ticket_id;
     std::vector<u8> data;
 };
 
@@ -326,7 +382,14 @@ public:
     bool Close() override;
     void Flush() const override;
 
-    Result Commit();
+    /// Returns a copy of the TMD data written so far.
+    std::vector<u8> GetData() const {
+        return data;
+    }
+
+    const std::shared_ptr<CurrentImportingTitle>& GetImportingTitle() const {
+        return importing_title;
+    }
 
 private:
     u64 written = 0;
@@ -337,9 +400,9 @@ private:
 // A file handled returned for contents to be written into and subsequently installed.
 class ContentFile final : public FileSys::FileBackend {
 public:
-    explicit ContentFile(const std::shared_ptr<CurrentImportingTitle>& import_context, u16 index_,
-                         ImportContentContext& import_context_)
-        : import_context(import_context_), importing_title(import_context), index(index_) {}
+    explicit ContentFile(std::weak_ptr<Module> am_,
+                         const std::shared_ptr<CurrentImportingTitle>& import_context, u16 index_)
+        : am(std::move(am_)), importing_title(import_context), index(index_) {}
     ~ContentFile();
 
     ResultVal<std::size_t> Read(u64 offset, std::size_t length, u8* buffer) const override;
@@ -352,20 +415,50 @@ public:
 
     void Cancel(FS::MediaType media_type, u64 title_id);
 
-    ImportContentContext& GetImportContext() {
-        return import_context;
+    u16 GetIndex() const {
+        return index;
     }
+
+    /// Returns the import context of this content, or nullptr if it no longer exists.
+    ImportContentContext* GetImportContext();
 
     void SetWritten(u64 written_) {
         written = written_;
     }
 
 private:
-    ImportContentContext& import_context;
+    // The import context is looked up on every use, as it can be erased while this file is open.
+    std::weak_ptr<Module> am;
 
     u64 written = 0;
     std::shared_ptr<CurrentImportingTitle> importing_title;
     u16 index;
+};
+
+class BundleCIAHandler {
+public:
+    BundleCIAHandler();
+
+    bool RegisterBundle(const std::string& filename);
+
+    std::vector<std::pair<u64, FS::MediaType>> List() const;
+
+    bool HasTitle(u64 title_id, FS::MediaType mediatype,
+                  u64 content_index = std::numeric_limits<u64>::max()) const;
+
+    bool HasContent(u64 title_id, FS::MediaType mediatype, u64 content_index);
+
+    const FileSys::Ticket* GetTicket(u64 title_id) const;
+
+    const FileSys::TitleMetadata* GetTitleMetadata(
+        u64 title_id, FS::MediaType mediatype,
+        u64 content_index = std::numeric_limits<u64>::max()) const;
+
+    std::unique_ptr<FileUtil::IOFileBase> OpenContentFile(u64 title_id, FS::MediaType mediatype,
+                                                          u64 content_index) const;
+
+private:
+    std::vector<FileSys::CIAContainer> cia_containers;
 };
 
 /**
@@ -382,8 +475,7 @@ InstallStatus InstallCIA(const std::string& path,
  * that can be installed.
  * @param path file path of the CIA file to check to install
  */
-InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed,
-                                bool check_encryption);
+InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed, bool& is_bundle);
 
 /**
  * Get CIA metadata information from file.
@@ -404,10 +496,18 @@ u64 GetTitleUpdateId(u64 title_id);
  */
 Service::FS::MediaType GetTitleMediaType(u64 titleId);
 
+FileSys::Ticket GetTicket(u64 title_id, u64 ticket_id);
+
 /**
  * Get the .tik path for a title_id and ticket_id.
  */
 std::string GetTicketPath(u64 title_id, u64 ticket_id);
+
+/**
+ * Get the .tmd for a title, unlike GetTitleMetadataPath, this supports bundled archives.
+ */
+FileSys::TitleMetadata GetTitleMetadata(Service::FS::MediaType media_type, u64 tid,
+                                        bool update = false);
 
 /**
  * Get the .tmd path for a title
@@ -417,6 +517,18 @@ std::string GetTicketPath(u64 title_id, u64 ticket_id);
  * @returns string path to the .tmd file if it exists, otherwise a path to create one is given.
  */
 std::string GetTitleMetadataPath(Service::FS::MediaType media_type, u64 tid, bool update = false);
+
+/**
+ * Check if the content is present (intalled or in bundle)
+ */
+bool TitleContentExists(Service::FS::MediaType media_type, u64 tid, std::size_t index,
+                        bool update = false);
+
+/**
+ * Opens a file to the specified content (installed or in bundle)
+ */
+std::unique_ptr<FileUtil::IOFileBase> GetTitleContent(Service::FS::MediaType media_type, u64 tid,
+                                                      std::size_t index, bool update = false);
 
 /**
  * Get the .app path for a title's installed content index.
@@ -1064,6 +1176,10 @@ public:
          */
         void GetDeviceCert(Kernel::HLERequestContext& ctx);
 
+        void ImportCertificates(Kernel::HLERequestContext& ctx);
+
+        void ImportCertificate(Kernel::HLERequestContext& ctx);
+
         void CommitImportTitlesAndUpdateFirmwareAuto(Kernel::HLERequestContext& ctx);
 
         void DeleteTicketId(Kernel::HLERequestContext& ctx);
@@ -1095,6 +1211,15 @@ public:
         std::shared_ptr<Network::ArticBase::Client> artic_client = nullptr;
     };
 
+    /// Returns the first import content context of the title with the given index, or nullptr.
+    ImportContentContext* FindImportContentContext(u64 title_id, u16 index);
+
+    /// Returns the content indices of the title that have an import pending.
+    std::set<u16> GetPendingImportContentIndices(u64 title_id) const;
+
+    /// Returns whether the title has an import pending.
+    bool IsTitleImportPending(u64 title_id) const;
+
     void ForceO3DSDeviceID() {
         force_old_device_id = true;
     }
@@ -1102,6 +1227,15 @@ public:
     void ForceN3DSDeviceID() {
         force_new_device_id = true;
     }
+
+    std::unique_ptr<BundleCIAHandler>& GetBundleCIAHandler() {
+        return bundle_cia_handler;
+    }
+
+    /**
+     * Scans all storage mediums for titles for listing.
+     */
+    void ScanForAllTitles();
 
 private:
     void ScanForTickets();
@@ -1115,11 +1249,6 @@ private:
     void ScanForTitles(Service::FS::MediaType media_type);
 
     void ScanForTitlesImpl(Service::FS::MediaType media_type);
-
-    /**
-     * Scans all storage mediums for titles for listing.
-     */
-    void ScanForAllTitles();
 
     Core::System& system;
     bool cia_installing = false;
@@ -1138,6 +1267,7 @@ private:
     std::shared_ptr<CurrentImportingTitle> importing_title;
     std::map<u64, ImportTitleContext> import_title_contexts;
     std::multimap<u64, ImportContentContext> import_content_contexts;
+    std::unique_ptr<BundleCIAHandler> bundle_cia_handler;
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

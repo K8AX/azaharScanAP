@@ -1,6 +1,6 @@
 // Copyright 2020-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <chrono>
 #include <sstream>
@@ -148,7 +148,8 @@ SaveStateInfo GetSaveStateInfo(u64 program_id, u64 movie_id, u32 slot) {
 void System::SaveState(u32 slot) const {
     if (app_loader) {
         if (!app_loader->SupportsSaveStates()) {
-            throw std::runtime_error("The current app loader doesn't support save states");
+            throw std::runtime_error("Savestates are not supported by the current application "
+                                     "loader (Artic Base).");
         }
     }
 
@@ -196,10 +197,12 @@ void System::SaveState(u32 slot) const {
 void System::LoadState(u32 slot) {
     if (app_loader) {
         if (!app_loader->SupportsSaveStates()) {
-            throw std::runtime_error("The current app loader doesn't support save states");
+            throw std::runtime_error("Savestates are not supported by the current application "
+                                     "loader (Artic Base)");
         }
     }
-    if (Network::GetRoomMember().lock()->IsConnected()) {
+    auto room_member = Network::GetRoomMember().lock();
+    if (room_member && room_member->IsConnected()) {
         throw std::runtime_error("Unable to load while connected to multiplayer");
     }
 

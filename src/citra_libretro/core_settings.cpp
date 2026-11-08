@@ -1,6 +1,6 @@
 // Copyright 2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <boost/hana/string.hpp>
 
@@ -39,6 +39,7 @@ static constexpr const char* input = "input";
 
 namespace cpu {
 static constexpr const char* use_cpu_jit = citra_setting(BaseKeys::use_cpu_jit);
+static constexpr const char* use_fastinterp = citra_setting(BaseKeys::use_fastinterp);
 static constexpr const char* cpu_clock_percentage = citra_setting(BaseKeys::cpu_clock_percentage);
 } // namespace cpu
 
@@ -143,6 +144,7 @@ static constexpr retro_core_option_v2_category option_categories[] = {
 
 static constexpr retro_core_option_v2_definition option_definitions[] = {
     // CPU Category
+#ifndef IOS
     {
         config::cpu::use_cpu_jit,
         "Enable CPU JIT",
@@ -150,6 +152,22 @@ static constexpr retro_core_option_v2_definition option_definitions[] = {
         "Enable Just-In-Time compilation for ARM CPU emulation. "
         "Significantly improves performance but may reduce accuracy. "
         "Restart required.",
+        nullptr,
+        config::category::cpu,
+        {
+            { config::enabled, "Enabled" },
+            { config::disabled, "Disabled" },
+            { nullptr, nullptr }
+        },
+        config::enabled
+    },
+#endif
+    {
+        config::cpu::use_fastinterp,
+        "Use Fast Interpreter",
+        "Fast Interpreter",
+        "When the CPU JIT is disabled or unavailable, use the fast interpreter "
+        "instead of the legacy interpreter. Restart required.",
         nullptr,
         config::category::cpu,
         {
@@ -312,6 +330,7 @@ static constexpr retro_core_option_v2_definition option_definitions[] = {
         },
         config::enabled
     },
+#ifndef IOS
     {
         config::graphics::use_shader_jit,
         "Enable Shader JIT",
@@ -327,6 +346,7 @@ static constexpr retro_core_option_v2_definition option_definitions[] = {
         },
         config::enabled
     },
+#endif
     {
         config::graphics::shaders_accurate_mul,
         "Accurate Shader Multiplication",
@@ -397,7 +417,7 @@ static constexpr retro_core_option_v2_definition option_definitions[] = {
         config::category::graphics,
         {
             { "none", "None" },
-            { "Anime4K Ultrafast", "Anime4K Ultrafast" },
+            { "Anime4K", "Anime4K (OpenGL only)" },
             { "Bicubic", "Bicubic" },
             { "ScaleForce", "ScaleForce" },
             { "xBRZ", "xBRZ" },
@@ -824,11 +844,14 @@ void RegisterCoreOptions(void) {
 
 static void ParseCpuOptions(void) {
     Settings::values.use_cpu_jit =
+#ifdef IOS
+        false;
+#else
         LibRetro::FetchVariable(config::cpu::use_cpu_jit, config::enabled) == config::enabled;
-#if defined(IOS)
-    if (!LibRetro::CanUseJIT())
-        Settings::values.use_cpu_jit = false;
 #endif
+
+    Settings::values.use_fastinterp =
+        LibRetro::FetchVariable(config::cpu::use_fastinterp, config::enabled) == config::enabled;
 
     auto cpu_clock = LibRetro::FetchVariable(config::cpu::cpu_clock_percentage, "100");
     Settings::values.cpu_clock_percentage = std::stoi(cpu_clock);
@@ -914,8 +937,14 @@ static void ParseAudioOptions(void) {
 }
 
 static Settings::TextureFilter GetTextureFilter(const std::string& name) {
-    if (name == "Anime4K Ultrafast")
-        return Settings::TextureFilter::Anime4K;
+    if (name == "Anime4K") {
+        const auto graphics_api = LibRetro::FetchVariable(config::graphics::graphics_api, "auto");
+        if (graphics_api == "Vulkan") {
+            return Settings::TextureFilter::NoFilter;
+        } else {
+            return Settings::TextureFilter::Anime4K;
+        }
+    }
     if (name == "Bicubic")
         return Settings::TextureFilter::Bicubic;
     if (name == "ScaleForce")
@@ -959,11 +988,12 @@ static void ParseGraphicsOptions(void) {
     Settings::values.use_hw_shader = LibRetro::FetchVariable(config::graphics::use_hw_shader,
                                                              config::enabled) == config::enabled;
 
-    Settings::values.use_shader_jit = LibRetro::FetchVariable(config::graphics::use_shader_jit,
-                                                              config::enabled) == config::enabled;
-#if defined(IOS)
-    if (!LibRetro::CanUseJIT())
-        Settings::values.use_shader_jit = false;
+    Settings::values.use_shader_jit =
+#ifdef IOS
+        false;
+#else
+        LibRetro::FetchVariable(config::graphics::use_shader_jit, config::enabled) ==
+        config::enabled;
 #endif
 
     Settings::values.shaders_accurate_mul =

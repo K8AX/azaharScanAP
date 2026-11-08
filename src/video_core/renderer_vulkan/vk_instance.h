@@ -1,6 +1,6 @@
 // Copyright 2022-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -151,6 +151,11 @@ public:
         return index_type_uint8;
     }
 
+    /// Returns true when VK_EXT_robustness2 is supported
+    bool IsNullDescriptorSupported() const {
+        return null_descriptor;
+    }
+
     /// Returns true when VK_EXT_fragment_shader_interlock is supported
     bool IsFragmentShaderInterlockSupported() const {
         return fragment_shader_interlock;
@@ -251,6 +256,13 @@ public:
         return triangle_fan_supported;
     }
 
+    // Returns true when shaderStorageImageMultisample, sampleRateShading,
+    // VK_KHR_create_renderpass2, VK_KHR_depth_stencil_resolve
+    bool IsMultiSampleSupported() const {
+        return features.shaderStorageImageMultisample && features.sampleRateShading &&
+               create_renderpass2 && depth_stencil_resolve;
+    }
+
     /// Returns true if dynamic indices can be used inside shaders.
     bool IsImageArrayDynamicIndexSupported() const {
         return features.shaderSampledImageArrayDynamicIndexing;
@@ -328,8 +340,11 @@ protected:
     bool extended_dynamic_state{};
     bool custom_border_color{};
     bool index_type_uint8{};
+    bool null_descriptor{};
     bool fragment_shader_interlock{};
     bool image_format_list{};
+    bool create_renderpass2{};
+    bool depth_stencil_resolve{};
     bool pipeline_creation_cache_control{};
     bool fragment_shader_barycentric{};
     bool shader_stencil_export{};

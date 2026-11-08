@@ -1,10 +1,11 @@
 // Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <cryptopp/aes.h>
 #include <cryptopp/modes.h>
 #include <fmt/format.h>
@@ -17,6 +18,7 @@
 #include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "common/tar_file.h"
 #include "common/zstd_compression.h"
 #include "core/core.h"
 #include "core/file_sys/certificate.h"
@@ -36,6 +38,7 @@
 #include "core/hle/service/am/am_net.h"
 #include "core/hle/service/am/am_sys.h"
 #include "core/hle/service/am/am_u.h"
+#include "core/hle/service/am/trust_chain.h"
 #include "core/hle/service/fs/archive.h"
 #include "core/hle/service/fs/fs_user.h"
 #include "core/hw/aes/key.h"
@@ -56,6 +59,20 @@ constexpr u16 CATEGORY_DLP = 0x0001;
 constexpr u8 VARIATION_SYSTEM = 0x02;
 constexpr u32 TID_HIGH_UPDATE = 0x0004000E;
 constexpr u32 TID_HIGH_DLC = 0x0004008C;
+
+constexpr Result ResultInvalidMediaType(ErrorDescription::InvalidEnumValue, ErrorModule::AM,
+                                        ErrorSummary::InvalidArgument, ErrorLevel::Usage);
+
+constexpr Result ResultReadNotSupported(ErrorDescription::NotImplemented, ErrorModule::AM,
+                                        ErrorSummary::NotSupported, ErrorLevel::Permanent);
+
+/// Imported tickets, TMDs and contents are stored on FAT32 partitions on hardware, so none of
+/// them can be larger than the maximum FAT32 file size.
+constexpr u64 MAX_IMPORT_FILE_SIZE = 0xFFFFFFFF;
+
+/// Maximum size of the part of a CIA before its contents (header, certificates, ticket and TMD),
+/// which is buffered in memory while installing.
+constexpr u64 MAX_CIA_PRE_CONTENT_SIZE = 8 * 1024 * 1024;
 
 constexpr u8 OWNERSHIP_DOWNLOADED = 0x01;
 constexpr u8 OWNERSHIP_OWNED = 0x02;
@@ -81,9 +98,30 @@ struct TicketInfo {
 
 static_assert(sizeof(TicketInfo) == 0x18, "Ticket info structure size is wrong");
 
+static bool IsInstallableMediaType(Service::FS::MediaType media_type) {
+    return media_type == Service::FS::MediaType::NAND || media_type == Service::FS::MediaType::SDMC;
+}
+
+static bool HasOversizedContent(const FileSys::TitleMetadata& tmd) {
+    for (std::size_t i = 0; i < tmd.GetContentCount(); i++) {
+        if (tmd.GetContentSizeByIndex(i) > MAX_IMPORT_FILE_SIZE) {
+            LOG_ERROR(Service_AM, "Content {} of title {:016X} is too large: 0x{:X}", i,
+                      tmd.GetTitleID(), tmd.GetContentSizeByIndex(i));
+            return true;
+        }
+    }
+    return false;
+}
+
 class CIAFile::DecryptionState {
 public:
     std::vector<CryptoPP::CBC_Mode<CryptoPP::AES>::Decryption> content;
+};
+
+class CIAFile::VerificationState {
+public:
+    // Hash of each content as received, after the title key decryption.
+    std::vector<CryptoPP::SHA256> content_hash;
 };
 
 NCCHCryptoFile::NCCHCryptoFile(const std::string& out_file, bool encrypted_content) {
@@ -328,6 +366,7 @@ void NCCHCryptoFile::Write(const u8* buffer, std::size_t length) {
             // This file has no encryption
             size_t to_write = length;
             file->WriteBytes(buffer, to_write);
+            RegisterExheader(written, buffer, to_write);
             written += to_write;
             buffer += to_write;
             length -= to_write;
@@ -336,6 +375,7 @@ void NCCHCryptoFile::Write(const u8* buffer, std::size_t length) {
                 // Not inside a crypto region
                 size_t to_write = std::min(length, reg->offset - written);
                 file->WriteBytes(buffer, to_write);
+                RegisterExheader(written, buffer, to_write);
                 written += to_write;
                 buffer += to_write;
                 length -= to_write;
@@ -370,6 +410,7 @@ void NCCHCryptoFile::Write(const u8* buffer, std::size_t length) {
                     }
                     d.ProcessData(temp.data(), buffer, to_write);
                     file->WriteBytes(temp.data(), to_write);
+                    RegisterExheader(written, temp.data(), to_write);
 
                     if (reg->type == CryptoRegion::EXEFS_HDR) {
                         if (exefs_header_written != sizeof(ExeFs_Header)) {
@@ -399,6 +440,7 @@ void NCCHCryptoFile::Write(const u8* buffer, std::size_t length) {
                     }
                 } else {
                     file->WriteBytes(buffer, to_write);
+                    RegisterExheader(written, buffer, to_write);
                 }
                 written += to_write;
                 buffer += to_write;
@@ -408,23 +450,44 @@ void NCCHCryptoFile::Write(const u8* buffer, std::size_t length) {
     }
 }
 
-void AuthorizeCIAFileDecryption(CIAFile* cia_file, Kernel::HLERequestContext& ctx) {
+void NCCHCryptoFile::RegisterExheader(std::size_t offset, const u8* data, std::size_t length) {
+    constexpr std::size_t start = sizeof(NCCH_Header);
+    constexpr std::size_t end = start + sizeof(ExHeader_Header);
+    if (offset >= end || offset + length <= start) {
+        return;
+    }
+    if (exheader.empty()) {
+        exheader.resize(sizeof(ExHeader_Header));
+    }
+    const std::size_t from = std::max(offset, start);
+    const std::size_t to = std::min(offset + length, end);
+    std::memcpy(exheader.data() + (from - start), data + (from - offset), to - from);
+}
+
+static bool IsCallerAuthorizedToDecrypt(Kernel::HLERequestContext& ctx) {
     u64 caller_tid = ctx.ClientThread()->owner_process.lock()->codeset->program_id;
-    if (Common::Hacks::hack_manager.GetHackAllowMode(
-            Common::Hacks::HackType::DECRYPTION_AUTHORIZED, caller_tid,
-            Common::Hacks::HackAllowMode::DISALLOW) == Common::Hacks::HackAllowMode::ALLOW) {
+    return Common::Hacks::hack_manager.GetHackAllowMode(
+               Common::Hacks::HackType::DECRYPTION_AUTHORIZED, caller_tid,
+               Common::Hacks::HackAllowMode::DISALLOW) == Common::Hacks::HackAllowMode::ALLOW;
+}
+
+void AuthorizeCIAFileDecryption(CIAFile* cia_file, Kernel::HLERequestContext& ctx) {
+    if (IsCallerAuthorizedToDecrypt(ctx)) {
         LOG_INFO(Service_AM, "Authorized encrypted CIA installation.");
         cia_file->decryption_authorized = true;
+        cia_file->do_signature_checks = true;
     }
 }
 
 void CIAFile::AuthorizeDecryptionFromHLE() {
     decryption_authorized = true;
+    do_signature_checks = true;
 }
 
 CIAFile::CIAFile(Core::System& system_, Service::FS::MediaType media_type, bool from_cdn_)
     : system(system_), from_cdn(from_cdn_), decryption_authorized(false), media_type(media_type),
-      decryption_state(std::make_unique<DecryptionState>()) {
+      decryption_state(std::make_unique<DecryptionState>()),
+      verification_state(std::make_unique<VerificationState>()) {
     // If data is being installing from CDN, provide a fake header to the container so that
     // it's not uninitialized.
     if (from_cdn) {
@@ -447,8 +510,7 @@ CIAFile::~CIAFile() {
 }
 
 ResultVal<std::size_t> CIAFile::Read(u64 offset, std::size_t length, u8* buffer) const {
-    UNIMPLEMENTED();
-    return length;
+    return ResultReadNotSupported;
 }
 
 CIAFile::InstallResult CIAFile::WriteTicket() {
@@ -463,7 +525,25 @@ CIAFile::InstallResult CIAFile::WriteTicket() {
         return res;
     }
 
-    const auto& ticket = container.GetTicket();
+    auto& ticket = container.GetTicket();
+    if (do_signature_checks) {
+        // Personalized tickets are only valid on the console they were issued to.
+        if (ticket.GetConsoleID() != 0) {
+            if (!ticket.IsPersonal()) {
+                res.result = ResultConsoleIDMismatch;
+                return res;
+            }
+            if (ticket.DoTitlekeyFixup() != Loader::ResultStatus::Success) {
+                res.result = ResultVerificationFailed;
+                return res;
+            }
+        }
+        res.result = VerifyTicket(ticket);
+        if (res.result.IsError()) {
+            LOG_ERROR(Service_AM, "Ticket of the CIA does not verify.");
+            return res;
+        }
+    }
     const auto ticket_path = GetTicketPath(ticket.GetTitleID(), ticket.GetTicketID());
 
     // Create ticket folder if it does not exist
@@ -485,30 +565,50 @@ CIAFile::InstallResult CIAFile::WriteTicket() {
     return res;
 }
 
-CIAFile::InstallResult CIAFile::WriteTitleMetadata(std::span<const u8> tmd_data,
-                                                   std::size_t offset) {
-    InstallResult res{};
+CIAFile::PreparedTitleMetadata CIAFile::PrepareTitleMetadata(Service::FS::MediaType media_type,
+                                                             bool is_update,
+                                                             std::span<const u8> tmd_data,
+                                                             std::size_t offset,
+                                                             bool do_signature_checks) {
+    PreparedTitleMetadata prepared{};
+    InstallResult& res = prepared.install_result;
     res.type = InstallResult::Type::TMD;
-    auto load_result = container.LoadTitleMetadata(tmd_data, offset);
+    auto load_result = prepared.tmd.Load(tmd_data, offset);
     if (load_result != Loader::ResultStatus::Success) {
         LOG_ERROR(Service_AM, "Could not read title metadata.");
         // TODO: Correct result code.
         res.result = {ErrCodes::InvalidCIAHeader, ErrorModule::AM, ErrorSummary::InvalidArgument,
                       ErrorLevel::Permanent};
-        return res;
+        return prepared;
     }
 
-    FileSys::TitleMetadata tmd = container.GetTitleMetadata();
+    FileSys::TitleMetadata& tmd = prepared.tmd;
     tmd.Print();
+
+    if (do_signature_checks) {
+        res.result = VerifyTitleMetadata(tmd);
+        if (res.result.IsError()) {
+            LOG_ERROR(Service_AM, "Title metadata does not verify.");
+            return prepared;
+        }
+    }
+
+    if (HasOversizedContent(tmd)) {
+        // TODO: Correct result code.
+        res.result = {ErrCodes::InvalidCIAHeader, ErrorModule::AM, ErrorSummary::InvalidArgument,
+                      ErrorLevel::Permanent};
+        return prepared;
+    }
 
     // If a TMD already exists for this app (ie 00000000.tmd), the incoming TMD
     // will be the same plus one, (ie 00000001.tmd), both will be kept until
     // the install is finalized and old contents can be discarded.
+    prepared.is_update = is_update;
     if (FileUtil::Exists(GetTitleMetadataPath(media_type, tmd.GetTitleID()))) {
-        is_update = true;
+        prepared.is_update = true;
     }
 
-    std::string tmd_path = GetTitleMetadataPath(media_type, tmd.GetTitleID(), is_update);
+    std::string tmd_path = GetTitleMetadataPath(media_type, tmd.GetTitleID(), prepared.is_update);
 
     // Create content/ folder if it doesn't exist
     std::string tmd_folder;
@@ -521,10 +621,76 @@ CIAFile::InstallResult CIAFile::WriteTitleMetadata(std::span<const u8> tmd_data,
         LOG_ERROR(Service_AM, "Failed to install title metadata file from CIA.");
         // TODO: Correct result code.
         res.result = FileSys::ResultFileNotFound;
+        return prepared;
+    }
+
+    PrepareContentPaths(media_type, prepared);
+    res.result = ResultSuccess;
+    return prepared;
+}
+
+CIAFile::PreparedTitleMetadata CIAFile::PrepareAdditionalContent(Service::FS::MediaType media_type,
+                                                                 bool is_update,
+                                                                 FileSys::TitleMetadata tmd,
+                                                                 bool do_signature_checks) {
+    PreparedTitleMetadata prepared{};
+    prepared.install_result.type = InstallResult::Type::TMD;
+    // On hardware, the TMD is checked again when each content is imported, so an installed
+    // TMD is checked too when contents are added to it.
+    if (do_signature_checks) {
+        prepared.install_result.result = VerifyTitleMetadata(tmd);
+        if (prepared.install_result.result.IsError()) {
+            LOG_ERROR(Service_AM, "Installed title metadata does not verify.");
+            return prepared;
+        }
+    }
+    if (HasOversizedContent(tmd)) {
+        // TODO: Correct result code.
+        prepared.install_result.result = {ErrCodes::InvalidCIAHeader, ErrorModule::AM,
+                                          ErrorSummary::InvalidArgument, ErrorLevel::Permanent};
+        return prepared;
+    }
+
+    prepared.tmd = std::move(tmd);
+    prepared.is_update = is_update;
+    PrepareContentPaths(media_type, prepared);
+    prepared.install_result.result = ResultSuccess;
+    return prepared;
+}
+
+void CIAFile::PrepareContentPaths(Service::FS::MediaType media_type,
+                                  PreparedTitleMetadata& prepared) {
+    const FileSys::TitleMetadata& tmd = prepared.tmd;
+
+    // Create any other .app folders which may not exist yet
+    std::string app_folder;
+    auto main_content_path = GetTitleContentPath(
+        media_type, tmd.GetTitleID(), FileSys::TMDContentIndex::Main, prepared.is_update);
+    Common::SplitPath(main_content_path, &app_folder, nullptr, nullptr);
+    FileUtil::CreateFullPath(app_folder);
+
+    prepared.content_paths.clear();
+    for (std::size_t i = 0; i < tmd.GetContentCount(); i++) {
+        prepared.content_paths.emplace_back(
+            GetTitleContentPath(media_type, tmd.GetTitleID(), i, prepared.is_update));
+    }
+}
+
+CIAFile::InstallResult CIAFile::WriteTitleMetadata(std::span<const u8> tmd_data,
+                                                   std::size_t offset) {
+    return ApplyTitleMetadata(
+        PrepareTitleMetadata(media_type, is_update, tmd_data, offset, do_signature_checks));
+}
+
+CIAFile::InstallResult CIAFile::ApplyTitleMetadata(PreparedTitleMetadata&& prepared) {
+    InstallResult res = prepared.install_result;
+    if (res.result.IsError()) {
         return res;
     }
 
-    res.result = PrepareToImportContent(tmd);
+    container.LoadTitleMetadata(prepared.tmd);
+    tmd_installed = true;
+    res.result = ApplyContentPreparation(std::move(prepared));
     return res;
 }
 
@@ -542,7 +708,9 @@ ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length,
 
             // The unwritten range for this content is beyond the buffered data we have
             // or comes before the buffered data we have, so skip this content ID.
-            if (range_min > offset_max || range_max < offset) {
+            // Content data must arrive in order: if the unwritten range starts before this
+            // write, the bytes in between were never received, so skip it as well.
+            if (range_min > offset_max || range_min < offset) {
                 continue;
             }
 
@@ -580,7 +748,16 @@ ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length,
                     install_results.push_back(current_content_install_result);
                     return current_content_install_result.result;
                 }
+                if (i >= decryption_state->content.size()) {
+                    LOG_ERROR(Service_AM, "No decryption state for content index {}", i);
+                    return Result(ErrCodes::InvalidImportState, ErrorModule::AM,
+                                  ErrorSummary::InvalidState, ErrorLevel::Permanent);
+                }
                 decryption_state->content[i].ProcessData(temp.data(), temp.data(), temp.size());
+            }
+
+            if (do_signature_checks && i < verification_state->content_hash.size()) {
+                verification_state->content_hash[i].Update(temp.data(), temp.size());
             }
 
             file.Write(temp.data(), temp.size());
@@ -598,6 +775,16 @@ ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length,
             content_written[i] += available_to_write;
             LOG_DEBUG(Service_AM, "Wrote {} to content {}, total {}", available_to_write, i,
                       content_written[i]);
+
+            // The am module finishes each content as soon as all of it is written.
+            if (do_signature_checks && content_written[i] == size) {
+                const Result verify_result = VerifyContent(static_cast<u16>(i));
+                if (verify_result.IsError()) {
+                    current_content_install_result.result = verify_result;
+                    install_results.push_back(current_content_install_result);
+                    return verify_result;
+                }
+            }
         }
     }
 
@@ -616,15 +803,24 @@ ResultVal<std::size_t> CIAFile::Write(u64 offset, std::size_t length, bool flush
     // The CIA Header describes Cert, Ticket, TMD, total content sizes, and TMD is needed for
     // content sizes so it ends up becoming a problem of keeping track of how much has been
     // written and what we have been able to pick up.
+
+    // Copies the part of this write that lies below limit into our buffer.
+    const auto buffer_data = [&](u64 limit) {
+        if (offset >= limit) {
+            return;
+        }
+        const u64 end = std::min(offset + static_cast<u64>(length), limit);
+        if (data.size() < end) {
+            data.resize(end);
+        }
+        std::memcpy(data.data() + offset, buffer, end - offset);
+    };
+
     if (install_state == CIAInstallState::InstallStarted) {
-        std::size_t buf_copy_size = std::min(length, FileSys::CIA_HEADER_SIZE);
-        std::size_t buf_max_size =
-            std::min(static_cast<std::size_t>(offset + length), FileSys::CIA_HEADER_SIZE);
-        data.resize(buf_max_size);
-        std::memcpy(data.data() + offset, buffer, buf_copy_size);
+        buffer_data(FileSys::CIA_HEADER_SIZE);
 
         // We have enough data to load a CIA header and parse it.
-        if (written >= FileSys::CIA_HEADER_SIZE) {
+        if (data.size() >= FileSys::CIA_HEADER_SIZE) {
             container.LoadHeader(data);
             container.Print();
             install_state = CIAInstallState::HeaderLoaded;
@@ -636,23 +832,39 @@ ResultVal<std::size_t> CIAFile::Write(u64 offset, std::size_t length, bool flush
         return length;
     }
 
+    // Everything before the contents is kept in memory, and it is never more than a few KiB on a
+    // real CIA, so refuse headers that would need a large buffer.
+    if (container.GetContentOffset() > MAX_CIA_PRE_CONTENT_SIZE) {
+        LOG_ERROR(Service_AM, "CIA content offset 0x{:X} is too large",
+                  container.GetContentOffset());
+        // TODO: Correct result code.
+        return Result(ErrCodes::InvalidCIAHeader, ErrorModule::AM, ErrorSummary::InvalidArgument,
+                      ErrorLevel::Permanent);
+    }
+
     // If we have been given data before (or including) .app content, pull it into
     // our buffer, but only pull *up to* the content offset, no further.
-    if (offset < container.GetContentOffset()) {
-        std::size_t buf_loaded = data.size();
-        std::size_t copy_offset = std::max(static_cast<std::size_t>(offset), buf_loaded);
-        std::size_t buf_offset = buf_loaded - offset;
-        std::size_t buf_copy_size =
-            std::min(length, static_cast<std::size_t>(container.GetContentOffset() - offset)) -
-            buf_offset;
-        std::size_t buf_max_size = std::min(offset + length, container.GetContentOffset());
-        data.resize(buf_max_size);
-        std::memcpy(data.data() + copy_offset, buffer + buf_offset, buf_copy_size);
-    }
+    buffer_data(container.GetContentOffset());
 
     // The end of our TMD is at the beginning of Content data, so ensure we have that much
     // buffered before trying to parse.
-    if (written >= container.GetContentOffset() && install_state != CIAInstallState::TMDLoaded) {
+    if (data.size() >= container.GetContentOffset() &&
+        install_state != CIAInstallState::TMDLoaded) {
+        // Only store the certificates when we have to do signature checks, in any other
+        // case the certificate would be invalid anyways and nothing would use it.
+        if (do_signature_checks) {
+            const u64 cert_offset = container.GetCertificateOffset();
+            const u64 cert_size = container.GetCertificateSize();
+            if (cert_offset > data.size() || cert_size > data.size() - cert_offset) {
+                return Result(ErrCodes::InvalidCIAHeader, ErrorModule::AM,
+                              ErrorSummary::InvalidArgument, ErrorLevel::Permanent);
+            }
+            const Result cert_result =
+                ImportCertificates(std::span<const u8>(data).subspan(cert_offset, cert_size));
+            if (cert_result.IsError()) {
+                return cert_result;
+            }
+        }
         InstallResult result = WriteTicket();
         install_results.push_back(result);
         if (result.result.IsError()) {
@@ -681,28 +893,27 @@ ResultVal<std::size_t> CIAFile::Write(u64 offset, std::size_t length, bool flush
     return length;
 }
 
-Result CIAFile::PrepareToImportContent(const FileSys::TitleMetadata& tmd) {
+Result CIAFile::ApplyContentPreparation(PreparedTitleMetadata&& prepared) {
+    is_update = prepared.is_update;
 
-    // Create any other .app folders which may not exist yet
-    std::string app_folder;
-    auto main_content_path = GetTitleContentPath(media_type, tmd.GetTitleID(),
-                                                 FileSys::TMDContentIndex::Main, is_update);
-    Common::SplitPath(main_content_path, &app_folder, nullptr, nullptr);
-    FileUtil::CreateFullPath(app_folder);
-
-    auto content_count = container.GetTitleMetadata().GetContentCount();
+    const FileSys::TitleMetadata& tmd = container.GetTitleMetadata();
+    auto content_count = tmd.GetContentCount();
     content_written.resize(content_count);
 
     current_content_file.reset();
     current_content_index = -1;
-    content_file_paths.clear();
-    for (std::size_t i = 0; i < content_count; i++) {
-        auto path = GetTitleContentPath(media_type, tmd.GetTitleID(), i, is_update);
-        content_file_paths.emplace_back(path);
+    content_file_paths = std::move(prepared.content_paths);
+
+    if (do_signature_checks) {
+        if (container.GetTicket().GetTitleID() != tmd.GetTitleID()) {
+            LOG_ERROR(Service_AM, "Ticket and title metadata are for different titles.");
+            return ResultESInvalidArgument;
+        }
+        verification_state->content_hash.clear();
+        verification_state->content_hash.resize(content_count);
     }
 
-    if (container.GetTitleMetadata().HasEncryptedContent(from_cdn ? nullptr
-                                                                  : container.GetHeader())) {
+    if (tmd.HasEncryptedContent(from_cdn ? nullptr : container.GetHeader())) {
         if (!decryption_authorized) {
             LOG_ERROR(Service_AM, "Blocked unauthorized encrypted CIA installation.");
             return {ErrorDescription::NotAuthorized, ErrorModule::AM, ErrorSummary::InvalidState,
@@ -747,7 +958,7 @@ Result CIAFile::ProvideTicket(const FileSys::Ticket& ticket) {
     return ResultSuccess;
 }
 
-Result CIAFile::ProvideTMDForAdditionalContent(const FileSys::TitleMetadata& tmd) {
+Result CIAFile::ApplyAdditionalContent(PreparedTitleMetadata&& prepared) {
     ASSERT_MSG(from_cdn, "This method should only be used when installing from CDN");
 
     if (install_state != CIAInstallState::TicketLoaded) {
@@ -757,7 +968,11 @@ Result CIAFile::ProvideTMDForAdditionalContent(const FileSys::TitleMetadata& tmd
                 ErrorLevel::Permanent};
     }
 
-    auto load_result = container.LoadTitleMetadata(tmd);
+    if (prepared.install_result.result.IsError()) {
+        return prepared.install_result.result;
+    }
+
+    auto load_result = container.LoadTitleMetadata(prepared.tmd);
     if (load_result != Loader::ResultStatus::Success) {
         LOG_ERROR(Service_AM, "Could not read ticket from CIA.");
         // TODO: Correct result code.
@@ -767,7 +982,7 @@ Result CIAFile::ProvideTMDForAdditionalContent(const FileSys::TitleMetadata& tmd
 
     is_additional_content = true;
 
-    return PrepareToImportContent(container.GetTitleMetadata());
+    return ApplyContentPreparation(std::move(prepared));
 }
 
 const FileSys::TitleMetadata& CIAFile::GetTMD() {
@@ -784,6 +999,13 @@ ResultVal<std::size_t> CIAFile::WriteContentDataIndexed(u16 content_index, u64 o
     ASSERT_MSG(from_cdn, "This method should only be used when installing from CDN");
 
     const FileSys::TitleMetadata& tmd = container.GetTitleMetadata();
+
+    if (content_index >= tmd.GetContentCount() || content_index >= content_written.size() ||
+        content_index >= content_file_paths.size()) {
+        LOG_ERROR(Service_AM, "Invalid content index {} for write", content_index);
+        return Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidArgument,
+                      ErrorLevel::Permanent);
+    }
 
     u64 remaining_to_write =
         tmd.GetContentSizeByIndex(content_index) - content_written[content_index];
@@ -816,7 +1038,16 @@ ResultVal<std::size_t> CIAFile::WriteContentDataIndexed(u16 content_index, u64 o
             install_results.push_back(current_content_install_result);
             return current_content_install_result.result;
         }
+        if (content_index >= decryption_state->content.size()) {
+            LOG_ERROR(Service_AM, "No decryption state for content index {}", content_index);
+            return Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
+                          ErrorLevel::Permanent);
+        }
         decryption_state->content[content_index].ProcessData(temp.data(), temp.data(), temp.size());
+    }
+
+    if (do_signature_checks && content_index < verification_state->content_hash.size()) {
+        verification_state->content_hash[content_index].Update(temp.data(), temp.size());
     }
 
     file.Write(temp.data(), temp.size());
@@ -834,6 +1065,46 @@ ResultVal<std::size_t> CIAFile::WriteContentDataIndexed(u16 content_index, u64 o
               content_written[content_index]);
 
     return temp.size();
+}
+
+Result CIAFile::VerifyContent(u16 content_index) {
+    const FileSys::TitleMetadata& tmd = container.GetTitleMetadata();
+    if (content_index >= content_written.size() ||
+        content_index >= verification_state->content_hash.size()) {
+        verification_failed = true;
+        return ResultESInvalidArgument;
+    }
+    if (content_written[content_index] != tmd.GetContentSizeByIndex(content_index)) {
+        LOG_ERROR(Service_AM, "Content {} has the wrong size", content_index);
+        verification_failed = true;
+        return ResultESInvalidArgument;
+    }
+    std::array<u8, CryptoPP::SHA256::DIGESTSIZE> digest;
+    verification_state->content_hash[content_index].Final(digest.data());
+    if (digest != tmd.GetContentHashByIndex(content_index)) {
+        LOG_ERROR(Service_AM, "Content {} hash does not match the title metadata", content_index);
+        verification_failed = true;
+        return ResultVerificationFailed;
+    }
+
+    // Skip checks for TWL titles.
+    constexpr u64 TwlTitleIdHigh = 0x12;
+    if ((tmd.GetTitleID() >> 46) == TwlTitleIdHigh) {
+        return ResultSuccess;
+    }
+
+    if (current_content_index != content_index || !current_content_file ||
+        current_content_file->is_not_ncch || !current_content_file->header_parsed) {
+        LOG_ERROR(Service_AM, "Content {} is not an NCCH", content_index);
+        verification_failed = true;
+        return ResultInvalidNCCH;
+    }
+    const Result ncch_result =
+        VerifyNCCHSignature(current_content_file->ncch_header, current_content_file->exheader);
+    if (ncch_result.IsError()) {
+        verification_failed = true;
+    }
+    return ncch_result;
 }
 
 u64 CIAFile::GetSize() const {
@@ -857,7 +1128,7 @@ bool CIAFile::Close() {
 
     bool complete;
 
-    if (is_cancel) {
+    if (is_cancel || verification_failed) {
         complete = false;
     } else {
         complete =
@@ -874,7 +1145,8 @@ bool CIAFile::Close() {
     // Install aborted
     if (!complete) {
         LOG_ERROR(Service_AM, "CIAFile closed prematurely or cancelled, aborting install...");
-        if (!is_additional_content) {
+        // Without an installed TMD there is nothing to clean up.
+        if (!is_additional_content && tmd_installed && IsInstallableMediaType(media_type)) {
             // Only delete the content folder as there may be user save data in the title folder.
             const std::string title_content_path =
                 GetTitlePath(media_type, container.GetTitleMetadata().GetTitleID()) + "content/";
@@ -934,14 +1206,19 @@ TicketFile::~TicketFile() {
 }
 
 ResultVal<std::size_t> TicketFile::Read(u64 offset, std::size_t length, u8* buffer) const {
-    UNIMPLEMENTED();
-    return length;
+    return ResultReadNotSupported;
 }
 
 ResultVal<std::size_t> TicketFile::Write(u64 offset, std::size_t length, bool flush,
                                          bool update_timestamp, const u8* buffer) {
+    const u64 end = offset + length;
+    if (end < offset || end > MAX_IMPORT_FILE_SIZE) {
+        return FileSys::ResultWriteBeyondEnd;
+    }
     written += length;
-    data.resize(written);
+    if (data.size() < end) {
+        data.resize(end);
+    }
     std::memcpy(data.data() + offset, buffer, length);
     return length;
 }
@@ -960,16 +1237,26 @@ bool TicketFile::Close() {
 
 void TicketFile::Flush() const {}
 
-Result TicketFile::Commit() {
+ResultVal<std::pair<u64, u64>> TicketFile::Commit(std::span<const u8> ticket_data,
+                                                  bool do_signature_checks) {
     FileSys::Ticket ticket;
-    if (ticket.Load(data, 0) == Loader::ResultStatus::Success) {
+    if (ticket.Load(ticket_data, 0) == Loader::ResultStatus::Success) {
+        // Personalized tickets are only valid on the console they were issued to.
+        if (do_signature_checks && ticket.GetConsoleID() != 0 && !ticket.IsPersonal()) {
+            return ResultConsoleIDMismatch;
+        }
         if (ticket.DoTitlekeyFixup() != Loader::ResultStatus::Success) {
             LOG_ERROR(Service_AM, "Failed to do ticket title key fixup");
             return ResultUnknown;
         }
+        if (do_signature_checks) {
+            const Result verify_result = VerifyTicket(ticket);
+            if (verify_result.IsError()) {
+                LOG_ERROR(Service_AM, "Ticket does not verify");
+                return verify_result;
+            }
+        }
 
-        title_id = ticket.GetTitleID();
-        ticket_id = ticket.GetTicketID();
         const auto ticket_path = GetTicketPath(ticket.GetTitleID(), ticket.GetTicketID());
 
         // Save ticket
@@ -977,7 +1264,7 @@ Result TicketFile::Commit() {
             LOG_ERROR(Service_AM, "Failed to install ticket provided to TicketFile.");
             return ResultUnknown;
         }
-        return ResultSuccess;
+        return std::make_pair(ticket.GetTitleID(), ticket.GetTicketID());
     } else {
         LOG_ERROR(Service_AM, "Invalid ticket provided to TicketFile.");
         return ResultUnknown;
@@ -989,14 +1276,19 @@ TMDFile::~TMDFile() {
 }
 
 ResultVal<std::size_t> TMDFile::Read(u64 offset, std::size_t length, u8* buffer) const {
-    UNIMPLEMENTED();
-    return length;
+    return ResultReadNotSupported;
 }
 
 ResultVal<std::size_t> TMDFile::Write(u64 offset, std::size_t length, bool flush,
                                       bool update_timestamp, const u8* buffer) {
+    const u64 end = offset + length;
+    if (end < offset || end > MAX_IMPORT_FILE_SIZE) {
+        return FileSys::ResultWriteBeyondEnd;
+    }
     written += length;
-    data.resize(written);
+    if (data.size() < end) {
+        data.resize(end);
+    }
     std::memcpy(data.data() + offset, buffer, length);
     return length;
 }
@@ -1015,26 +1307,35 @@ bool TMDFile::Close() {
 
 void TMDFile::Flush() const {}
 
-Result TMDFile::Commit() {
-    return importing_title->cia_file.WriteTitleMetadata(data, 0).result;
-}
-
 ContentFile::~ContentFile() {
     Close();
 }
 
 ResultVal<std::size_t> ContentFile::Read(u64 offset, std::size_t length, u8* buffer) const {
-    UNIMPLEMENTED();
-    return length;
+    return ResultReadNotSupported;
 }
 
 ResultVal<std::size_t> ContentFile::Write(u64 offset, std::size_t length, bool flush,
                                           bool update_timestamp, const u8* buffer) {
+    if (importing_title->tmd_import_pending) {
+        return Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
+                      ErrorLevel::Permanent);
+    }
     auto res = importing_title->cia_file.WriteContentDataIndexed(index, offset, length, buffer);
     if (res.Succeeded()) {
-        import_context.current_size += static_cast<u64>(res.Unwrap());
+        if (auto context = GetImportContext()) {
+            context->current_size += static_cast<u64>(res.Unwrap());
+        }
     }
     return res;
+}
+
+ImportContentContext* ContentFile::GetImportContext() {
+    auto module = am.lock();
+    if (!module) {
+        return nullptr;
+    }
+    return module->FindImportContentContext(importing_title->title_id, index);
 }
 
 u64 ContentFile::GetSize() const {
@@ -1052,8 +1353,117 @@ bool ContentFile::Close() {
 void ContentFile::Flush() const {}
 
 void ContentFile::Cancel(FS::MediaType media_type, u64 title_id) {
+    if (!IsInstallableMediaType(media_type)) {
+        return;
+    }
     auto path = GetTitleContentPath(media_type, title_id, index, true);
     FileUtil::Delete(path);
+}
+
+BundleCIAHandler::BundleCIAHandler() = default;
+
+bool BundleCIAHandler::RegisterBundle(const std::string& filename) {
+    auto tar = FileUtil::TarArchive(filename);
+    auto files = tar.GetFileList();
+    if (files.empty()) {
+        LOG_ERROR(Service_AM, "Failed to parse bundle file");
+        return false;
+    }
+    for (auto f : files) {
+        if (f.name.ends_with(".cia") || f.name.ends_with(".zcia")) {
+            auto sub_file = tar.OpenSubFile(f.name);
+            if (!sub_file->IsGood()) {
+                LOG_ERROR(Service_AM, "Failed to open sub file {}", f.name);
+                cia_containers.clear();
+                return false;
+            }
+            if (FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(sub_file.get()) != std::nullopt) {
+                sub_file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(sub_file));
+            }
+            cia_containers.emplace_back();
+            auto res = cia_containers.back().Load(std::move(sub_file));
+            if (res != Loader::ResultStatus::Success) {
+                LOG_ERROR(Service_AM, "Failed to parse bundled cia file {}: (error {})", f.name,
+                          res);
+                cia_containers.clear();
+                return false;
+            }
+            if (cia_containers.back().GetTitleMetadata().HasEncryptedContent(
+                    cia_containers.back().GetHeader())) {
+                LOG_ERROR(Service_AM, "Bundle contains encrypted cia file {}", f.name);
+                cia_containers.clear();
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<std::pair<u64, FS::MediaType>> BundleCIAHandler::List() const {
+    std::vector<std::pair<u64, FS::MediaType>> ret;
+    for (auto& c : cia_containers) {
+        u64 title_id = c.GetTitleMetadata().GetTitleID();
+        ret.push_back({title_id, Service::AM::GetTitleMediaType(title_id)});
+    }
+    return ret;
+}
+
+bool BundleCIAHandler::HasTitle(u64 title_id, FS::MediaType mediatype, u64 content_index) const {
+    for (auto& c : cia_containers) {
+        if (c.GetTitleMetadata().GetTitleID() == title_id &&
+            Service::AM::GetTitleMediaType(title_id) == mediatype &&
+            (content_index == std::numeric_limits<u64>::max() ||
+             content_index < c.GetTitleMetadata().GetContentCount())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool BundleCIAHandler::HasContent(u64 title_id, FS::MediaType mediatype, u64 content_index) {
+    for (auto& c : cia_containers) {
+        if (c.GetTitleMetadata().GetTitleID() == title_id &&
+            Service::AM::GetTitleMediaType(title_id) == mediatype) {
+            return c.GetHeader()->IsContentPresent(content_index);
+        }
+    }
+    return false;
+}
+
+const FileSys::Ticket* BundleCIAHandler::GetTicket(u64 title_id) const {
+    for (const auto& c : cia_containers) {
+        if (c.GetTitleMetadata().GetTitleID() == title_id) {
+            return &c.GetTicket();
+        }
+    }
+    return nullptr;
+}
+
+const FileSys::TitleMetadata* BundleCIAHandler::GetTitleMetadata(u64 title_id,
+                                                                 FS::MediaType mediatype,
+                                                                 u64 content_index) const {
+    for (const auto& c : cia_containers) {
+        if (c.GetTitleMetadata().GetTitleID() == title_id &&
+            Service::AM::GetTitleMediaType(title_id) == mediatype &&
+            (content_index == std::numeric_limits<u64>::max() ||
+             content_index < c.GetTitleMetadata().GetContentCount())) {
+            return &c.GetTitleMetadata();
+        }
+    }
+    return nullptr;
+}
+
+std::unique_ptr<FileUtil::IOFileBase> BundleCIAHandler::OpenContentFile(u64 title_id,
+                                                                        FS::MediaType mediatype,
+                                                                        u64 content_index) const {
+    for (const auto& c : cia_containers) {
+        if (c.GetTitleMetadata().GetTitleID() == title_id &&
+            Service::AM::GetTitleMediaType(title_id) == mediatype &&
+            content_index < c.GetTitleMetadata().GetContentCount()) {
+            return c.GetContentFile(content_index);
+        }
+    }
+    return std::make_unique<FileUtil::NullIOFile>();
 }
 
 InstallStatus InstallCIA(const std::string& path,
@@ -1065,83 +1475,133 @@ InstallStatus InstallCIA(const std::string& path,
         return InstallStatus::ErrorFileNotFound;
     }
 
-    std::unique_ptr<FileUtil::IOFileBase> in_file = std::make_unique<FileUtil::IOFile>(path, "rb");
-    bool is_compressed =
-        FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(in_file.get()) != std::nullopt;
-    if (is_compressed) {
-        in_file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(in_file));
+    auto install_single_cia = [&update_callback](std::unique_ptr<FileUtil::IOFileBase> in_file,
+                                                 const std::string& path) {
+        bool is_compressed =
+            FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(in_file.get()) != std::nullopt;
+        if (is_compressed) {
+            in_file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(in_file));
+        }
+
+        FileSys::CIAContainer container;
+        if (container.Load(in_file.get()) == Loader::ResultStatus::Success) {
+            in_file->Seek(0, SEEK_SET);
+            Service::AM::CIAFile installFile(
+                Core::System::GetInstance(),
+                Service::AM::GetTitleMediaType(container.GetTitleMetadata().GetTitleID()));
+
+            if (container.GetTitleMetadata().HasEncryptedContent(container.GetHeader())) {
+                LOG_ERROR(Service_AM, "File {} is encrypted! Aborting...", path);
+                return InstallStatus::ErrorEncrypted;
+            }
+
+            std::vector<u8> buffer;
+            buffer.resize(0x10000);
+            auto file_size = in_file->GetSize();
+            std::size_t total_bytes_read = 0;
+            while (total_bytes_read != file_size) {
+                std::size_t bytes_read = in_file->ReadBytes(buffer.data(), buffer.size());
+                auto result = installFile.Write(static_cast<u64>(total_bytes_read), bytes_read,
+                                                true, false, static_cast<u8*>(buffer.data()));
+
+                if (update_callback) {
+                    update_callback(total_bytes_read, file_size);
+                }
+                if (result.Failed()) {
+                    LOG_ERROR(Service_AM, "CIA file installation aborted with error code {:08x}",
+                              result.Code().raw);
+                    return InstallStatus::ErrorAborted;
+                }
+                total_bytes_read += bytes_read;
+            }
+            installFile.Close();
+
+            InstallStatus install_res = InstallStatus::Success;
+            for (auto result : installFile.GetInstallResults()) {
+                if (result.type != CIAFile::InstallResult::Type::APP || result.result.IsError()) {
+                    continue;
+                }
+
+                std::unique_ptr<Loader::AppLoader> loader =
+                    Loader::GetLoader(result.install_full_path);
+                if (!loader) {
+                    continue;
+                }
+
+                bool executable = false;
+                const auto res = loader->IsExecutable(executable);
+                if (res == Loader::ResultStatus::ErrorEncrypted) {
+                    LOG_ERROR(Service_AM, "CIA contains encrypted content: {}", path,
+                              result.install_full_path);
+                    install_res = InstallStatus::ErrorEncrypted;
+                }
+            }
+            if (install_res == InstallStatus::Success) {
+                LOG_INFO(Service_AM, "Installed {} successfully.", path);
+            }
+            return install_res;
+        }
+
+        LOG_ERROR(Service_AM, "CIA file {} is invalid!", path);
+        return InstallStatus::ErrorInvalid;
+    };
+
+    // Check bcia first
+    if (auto tar = FileUtil::TarArchive::OpenTarArchive(path)) {
+        auto files = tar->GetFileList();
+        if (files.empty()) {
+            LOG_ERROR(Service_AM, "Failed to parse BCIA file");
+            return InstallStatus::ErrorInvalid;
+        }
+        for (auto f : files) {
+            if (f.name.ends_with(".cia") || f.name.ends_with(".zcia")) {
+                auto sub_file = tar->OpenSubFile(f.name);
+                if (!sub_file->IsGood()) {
+                    LOG_ERROR(Service_AM, "Failed to open sub file {}", f.name);
+                    return InstallStatus::ErrorInvalid;
+                }
+                auto res = install_single_cia(std::move(sub_file), path + ":" + f.name);
+                if (res != InstallStatus::Success) {
+                    LOG_ERROR(Service_AM, "Aborting BCIA install");
+                    return res;
+                }
+            } else {
+                LOG_WARNING(Service_AM, "Skipping unknown file {}", f.name);
+            }
+        }
+        return InstallStatus::Success;
+    } else {
+        return install_single_cia(std::make_unique<FileUtil::IOFile>(path, "rb"), path);
     }
-
-    FileSys::CIAContainer container;
-    if (container.Load(in_file.get()) == Loader::ResultStatus::Success) {
-        in_file->Seek(0, SEEK_SET);
-        Service::AM::CIAFile installFile(
-            Core::System::GetInstance(),
-            Service::AM::GetTitleMediaType(container.GetTitleMetadata().GetTitleID()));
-
-        if (container.GetTitleMetadata().HasEncryptedContent(container.GetHeader())) {
-            LOG_ERROR(Service_AM, "File {} is encrypted! Aborting...", path);
-            return InstallStatus::ErrorEncrypted;
-        }
-
-        std::vector<u8> buffer;
-        buffer.resize(0x10000);
-        auto file_size = in_file->GetSize();
-        std::size_t total_bytes_read = 0;
-        while (total_bytes_read != file_size) {
-            std::size_t bytes_read = in_file->ReadBytes(buffer.data(), buffer.size());
-            auto result = installFile.Write(static_cast<u64>(total_bytes_read), bytes_read, true,
-                                            false, static_cast<u8*>(buffer.data()));
-
-            if (update_callback) {
-                update_callback(total_bytes_read, file_size);
-            }
-            if (result.Failed()) {
-                LOG_ERROR(Service_AM, "CIA file installation aborted with error code {:08x}",
-                          result.Code().raw);
-                return InstallStatus::ErrorAborted;
-            }
-            total_bytes_read += bytes_read;
-        }
-        installFile.Close();
-
-        InstallStatus install_res = InstallStatus::Success;
-        for (auto result : installFile.GetInstallResults()) {
-            if (result.type != CIAFile::InstallResult::Type::APP || result.result.IsError()) {
-                continue;
-            }
-
-            std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(result.install_full_path);
-            if (!loader) {
-                continue;
-            }
-
-            bool executable = false;
-            const auto res = loader->IsExecutable(executable);
-            if (res == Loader::ResultStatus::ErrorEncrypted) {
-                LOG_ERROR(Service_AM, "CIA contains encrypted content: {}", path,
-                          result.install_full_path);
-                install_res = InstallStatus::ErrorEncrypted;
-            }
-        }
-        if (install_res == InstallStatus::Success) {
-            LOG_INFO(Service_AM, "Installed {} successfully.", path);
-        }
-        return install_res;
-    }
-
-    LOG_ERROR(Service_AM, "CIA file {} is invalid!", path);
-    return InstallStatus::ErrorInvalid;
 }
 
-InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed,
-                                bool check_encryption) {
+InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed, bool& is_bundle) {
     if (!FileUtil::Exists(path)) {
         LOG_ERROR(Service_AM, "File {} does not exist!", path);
         return InstallStatus::ErrorFileNotFound;
     }
 
     std::unique_ptr<FileUtil::IOFileBase> in_file = std::make_unique<FileUtil::IOFile>(path, "rb");
+
+    if (auto tar = FileUtil::TarArchive::OpenTarArchive(in_file->OpenCopy())) {
+        auto files = tar->GetFileList();
+        bool has_cia = false;
+        for (const auto& f : files) {
+            if (f.name.ends_with(".cia") || f.name.ends_with(".zcia")) {
+                has_cia = true;
+            } else if (f.name != "metadata") {
+                // Bundles only contain CIA files, besides the metadata written by the bundler.
+                return InstallStatus::ErrorInvalid;
+            }
+        }
+        if (!has_cia) {
+            return InstallStatus::ErrorInvalid;
+        }
+        is_bundle = true;
+        is_compressed = false;
+        return InstallStatus::ErrorCannotCheckBundle;
+    }
+
     is_compressed = FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(in_file.get()) != std::nullopt;
     if (is_compressed) {
         in_file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(in_file));
@@ -1152,24 +1612,22 @@ InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed,
         in_file->Seek(0, SEEK_SET);
         const FileSys::TitleMetadata& tmd = container.GetTitleMetadata();
 
-        if (check_encryption) {
-            if (tmd.HasEncryptedContent(container.GetHeader())) {
-                return InstallStatus::ErrorEncrypted;
-            }
+        if (tmd.HasEncryptedContent(container.GetHeader())) {
+            return InstallStatus::ErrorEncrypted;
+        }
 
-            for (size_t i = 0; i < tmd.GetContentCount(); i++) {
-                u64 offset = container.GetContentOffset(i);
-                NCCH_Header ncch;
-                const auto read = in_file->ReadAtBytes(&ncch, sizeof(ncch), offset);
-                if (read != sizeof(ncch)) {
-                    return InstallStatus::ErrorInvalid;
-                }
-                if (ncch.magic != FileUtil::MakeMagic('N', 'C', 'C', 'H')) {
-                    return InstallStatus::ErrorInvalid;
-                }
-                if (!ncch.no_crypto) {
-                    return InstallStatus::ErrorEncrypted;
-                }
+        for (size_t i = 0; i < tmd.GetContentCount(); i++) {
+            u64 offset = container.GetContentOffset(i);
+            NCCH_Header ncch;
+            const auto read = in_file->ReadAtBytes(&ncch, sizeof(ncch), offset);
+            if (read != sizeof(ncch)) {
+                return InstallStatus::ErrorInvalid;
+            }
+            if (ncch.magic != FileUtil::MakeMagic('N', 'C', 'C', 'H')) {
+                return InstallStatus::ErrorInvalid;
+            }
+            if (!ncch.no_crypto) {
+                return InstallStatus::ErrorEncrypted;
             }
         }
 
@@ -1233,17 +1691,60 @@ std::string GetTicketDirectory() {
     return fmt::format("{}/dbs/ticket.db/", FileUtil::GetUserPath(FileUtil::UserPath::NANDDir));
 }
 
+FileSys::Ticket GetTicket(u64 title_id, u64 ticket_id) {
+    FileSys::Ticket ticket;
+    ticket.Load(title_id, ticket_id);
+    if (ticket.LoadResult() == Loader::ResultStatus::Success) {
+        return ticket;
+    }
+
+    auto am = GetModule(Core::Global<Core::System>());
+    if (am) {
+        auto& bundle_handler = am->GetBundleCIAHandler();
+        auto* bundle_ticket = bundle_handler->GetTicket(title_id);
+        if (bundle_ticket) {
+            return *bundle_ticket;
+        }
+    }
+
+    return ticket;
+}
+
 std::string GetTicketPath(u64 title_id, u64 ticket_id) {
     return GetTicketDirectory() + fmt::format("{:016X}.{:016X}.tik", title_id, ticket_id);
 }
 
-std::string GetTitleMetadataPath(Service::FS::MediaType media_type, u64 tid, bool update) {
-    std::string content_path = GetTitlePath(media_type, tid) + "content/";
+FileSys::TitleMetadata GetTitleMetadata(Service::FS::MediaType media_type, u64 tid, bool update) {
+    auto path = GetTitleMetadataPath(media_type, tid, update);
+    FileSys::TitleMetadata tmd;
+    tmd.Load(path);
+    if (tmd.LoadResult() == Loader::ResultStatus::Success) {
+        return tmd;
+    }
 
+    auto am = GetModule(Core::Global<Core::System>());
+    if (am && !update) {
+        auto& bundle_handler = am->GetBundleCIAHandler();
+        if (bundle_handler->HasTitle(tid, media_type)) {
+            return *bundle_handler->GetTitleMetadata(tid, media_type);
+        }
+    }
+
+    return tmd;
+}
+
+std::string GetTitleMetadataPath(Service::FS::MediaType media_type, u64 tid, bool update) {
     if (media_type == Service::FS::MediaType::GameCard) {
         LOG_ERROR(Service_AM, "Invalid request for nonexistent gamecard title metadata!");
         return "";
     }
+
+    if (!IsInstallableMediaType(media_type)) {
+        LOG_ERROR(Service_AM, "Invalid media type {}", media_type);
+        return "";
+    }
+
+    std::string content_path = GetTitlePath(media_type, tid) + "content/";
 
     // The TMD ID is usually held in the title databases, which we don't implement.
     // For now, just scan for any .tmd files which exist, the smallest will be the
@@ -1275,6 +1776,41 @@ std::string GetTitleMetadataPath(Service::FS::MediaType media_type, u64 tid, boo
     return content_path + fmt::format("{:08x}.tmd", (update ? update_id : base_id));
 }
 
+bool TitleContentExists(Service::FS::MediaType media_type, u64 tid, std::size_t index,
+                        bool update) {
+    if (FileUtil::Exists(GetTitleContentPath(media_type, tid, index, update))) {
+        return true;
+    }
+
+    auto am = GetModule(Core::Global<Core::System>());
+    if (am && !update) {
+        auto& bundle_handler = am->GetBundleCIAHandler();
+        if (bundle_handler->HasTitle(tid, media_type)) {
+            return bundle_handler->HasContent(tid, media_type, index);
+        }
+    }
+
+    return false;
+}
+
+std::unique_ptr<FileUtil::IOFileBase> GetTitleContent(Service::FS::MediaType media_type, u64 tid,
+                                                      std::size_t index, bool update) {
+    std::string path = GetTitleContentPath(media_type, tid, index, update);
+    if (FileUtil::Exists(path)) {
+        return std::make_unique<FileUtil::IOFile>(path, "rb");
+    }
+
+    auto am = GetModule(Core::Global<Core::System>());
+    if (am && !update) {
+        auto& bundle_handler = am->GetBundleCIAHandler();
+        if (bundle_handler->HasTitle(tid, media_type, index)) {
+            return bundle_handler->OpenContentFile(tid, media_type, index);
+        }
+    }
+
+    return std::make_unique<FileUtil::NullIOFile>();
+}
+
 std::string GetTitleContentPath(Service::FS::MediaType media_type, u64 tid, std::size_t index,
                                 bool update) {
 
@@ -1284,6 +1820,11 @@ std::string GetTitleContentPath(Service::FS::MediaType media_type, u64 tid, std:
             Core::System::GetInstance().ServiceManager().GetService<Service::FS::FS_USER>(
                 "fs:USER");
         return fs_user->GetRegisteredGamecardPath();
+    }
+
+    if (!IsInstallableMediaType(media_type)) {
+        LOG_ERROR(Service_AM, "Invalid media type {}", media_type);
+        return "";
     }
 
     std::string content_path = GetTitlePath(media_type, tid) + "content/";
@@ -1352,6 +1893,7 @@ std::string GetMediaTitlePath(Service::FS::MediaType media_type) {
         return fs_user->GetRegisteredGamecardPath();
     }
 
+    ASSERT_MSG(false, "Invalid media type {} passed to GetMediaTitlePath", media_type);
     return "";
 }
 
@@ -1393,6 +1935,19 @@ void Module::ScanForTicketsImpl() {
             }
         }
     }
+
+    // Scan the bundle if it exists
+    auto am = GetModule(Core::Global<Core::System>());
+    if (am) {
+        auto& bundle_handler = am->GetBundleCIAHandler();
+        auto list = bundle_handler->List();
+        for (auto& e : list) {
+            if (am_ticket_list.find(e.first) == am_ticket_list.end()) {
+                auto ticket = bundle_handler->GetTicket(e.first);
+                am_ticket_list.insert(std::make_pair(e.first, ticket->GetTicketID()));
+            }
+        }
+    }
     LOG_DEBUG(Service_AM, "Finished ticket scan");
 }
 
@@ -1408,6 +1963,11 @@ void Module::ScanForTitles(Service::FS::MediaType media_type) {
 }
 
 void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
+    if (static_cast<u32>(media_type) >= am_title_list.size()) {
+        LOG_ERROR(Service_AM, "Invalid media type {}", media_type);
+        return;
+    }
+
     am_title_list[static_cast<u32>(media_type)].clear();
 
     LOG_DEBUG(Service_AM, "Starting title scan for media_type={}", static_cast<int>(media_type));
@@ -1453,6 +2013,21 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
                             am_title_list[static_cast<u32>(media_type)].push_back(tid);
                         }
                     }
+                }
+            }
+        }
+
+        // Scan the bundle if it exists
+        auto am = GetModule(Core::Global<Core::System>());
+        if (am) {
+            auto& bundle_handler = am->GetBundleCIAHandler();
+            auto list = bundle_handler->List();
+            for (auto& e : list) {
+                if (e.second == media_type &&
+                    std::find(am_title_list[static_cast<u32>(media_type)].begin(),
+                              am_title_list[static_cast<u32>(media_type)].end(),
+                              e.first) == am_title_list[static_cast<u32>(media_type)].end()) {
+                    am_title_list[static_cast<u32>(media_type)].push_back(e.first);
                 }
             }
         }
@@ -1541,6 +2116,14 @@ void Module::Interface::GetNumPrograms(Kernel::HLERequestContext& ctx) {
             },
             true);
     } else {
+        if (media_type >= static_cast<u8>(FS::MediaType::Count)) {
+            IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+            // TODO: Find the right error code
+            rb.Push<Result>(ResultInvalidMediaType);
+            rb.Push<u32>(0);
+            return;
+        }
+
         std::scoped_lock lock(am->am_lists_mutex);
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
         rb.Push(ResultSuccess);
@@ -1622,6 +2205,7 @@ void Module::Interface::FindDLCContentInfos(Kernel::HLERequestContext& ctx) {
         struct AsyncData {
             Service::FS::MediaType media_type;
             u64 title_id;
+            std::set<u16> pending_indices;
             std::vector<u16> content_requested;
 
             Result res{0};
@@ -1635,6 +2219,7 @@ void Module::Interface::FindDLCContentInfos(Kernel::HLERequestContext& ctx) {
         content_requested_in.Read(async_data->content_requested.data(), 0,
                                   content_count * sizeof(u16));
         async_data->content_info_out = &rp.PopMappedBuffer();
+        async_data->pending_indices = am->GetPendingImportContentIndices(title_id);
 
         ctx.RunAsync(
             [this, async_data](Kernel::HLERequestContext& ctx) {
@@ -1646,8 +2231,8 @@ void Module::Interface::FindDLCContentInfos(Kernel::HLERequestContext& ctx) {
                     return 0;
                 }
 
-                std::string tmd_path =
-                    GetTitleMetadataPath(async_data->media_type, async_data->title_id);
+                FileSys::TitleMetadata tmd =
+                    GetTitleMetadata(async_data->media_type, async_data->title_id);
 
                 // In normal circumstances, if there is no ticket we shouldn't be able to have
                 // any contents either. However to keep compatibility with older emulator builds,
@@ -1656,14 +2241,14 @@ void Module::Interface::FindDLCContentInfos(Kernel::HLERequestContext& ctx) {
                 FileSys::Ticket ticket;
                 std::scoped_lock lock(am->am_lists_mutex);
                 auto entries = am->am_ticket_list.find(async_data->title_id);
-                if (entries != am->am_ticket_list.end() &&
-                    ticket.Load(async_data->title_id, (*entries).second) ==
-                        Loader::ResultStatus::Success) {
-                    has_ticket = true;
+                if (entries != am->am_ticket_list.end()) {
+                    ticket = GetTicket(async_data->title_id, (*entries).second);
+                    if (ticket.LoadResult() == Loader::ResultStatus::Success) {
+                        has_ticket = true;
+                    }
                 }
 
-                FileSys::TitleMetadata tmd;
-                if (tmd.Load(tmd_path) == Loader::ResultStatus::Success) {
+                if (tmd.LoadResult() == Loader::ResultStatus::Success) {
                     // Get info for each content index requested
                     for (std::size_t i = 0; i < async_data->content_requested.size(); i++) {
                         u16_le index = async_data->content_requested[i];
@@ -1685,24 +2270,10 @@ void Module::Interface::FindDLCContentInfos(Kernel::HLERequestContext& ctx) {
                         content_info.ownership =
                             (!has_ticket || ticket.HasRights(index)) ? OWNERSHIP_OWNED : 0;
 
-                        if (FileUtil::Exists(GetTitleContentPath(async_data->media_type,
-                                                                 async_data->title_id, index))) {
-                            bool pending = false;
-                            for (auto& import_ctx : am->import_content_contexts) {
-                                if (import_ctx.first == async_data->title_id &&
-                                    import_ctx.second.index == index &&
-                                    (import_ctx.second.state ==
-                                         ImportTitleContextState::WAITING_FOR_IMPORT ||
-                                     import_ctx.second.state ==
-                                         ImportTitleContextState::WAITING_FOR_COMMIT ||
-                                     import_ctx.second.state ==
-                                         ImportTitleContextState::RESUMABLE)) {
-                                    LOG_DEBUG(Service_AM, "content pending commit index={:016X}",
-                                              i);
-                                    pending = true;
-                                    break;
-                                }
-                            }
+                        if (TitleContentExists(async_data->media_type, async_data->title_id,
+                                               index)) {
+                            const bool pending =
+                                async_data->pending_indices.contains(static_cast<u16>(index));
                             if (!pending) {
                                 content_info.ownership |= OWNERSHIP_DOWNLOADED;
                             }
@@ -1802,6 +2373,7 @@ void Module::Interface::ListDLCContentInfos(Kernel::HLERequestContext& ctx) {
         struct AsyncData {
             Service::FS::MediaType media_type;
             u64 title_id;
+            std::set<u16> pending_indices;
             u32 content_count;
             u32 start_index;
 
@@ -1815,6 +2387,7 @@ void Module::Interface::ListDLCContentInfos(Kernel::HLERequestContext& ctx) {
         async_data->content_count = content_count;
         async_data->start_index = start_index;
         async_data->content_info_out = &rp.PopMappedBuffer();
+        async_data->pending_indices = am->GetPendingImportContentIndices(title_id);
 
         ctx.RunAsync(
             [this, async_data](Kernel::HLERequestContext& ctx) {
@@ -1826,8 +2399,8 @@ void Module::Interface::ListDLCContentInfos(Kernel::HLERequestContext& ctx) {
                     return 0;
                 }
 
-                std::string tmd_path =
-                    GetTitleMetadataPath(async_data->media_type, async_data->title_id);
+                FileSys::TitleMetadata tmd =
+                    GetTitleMetadata(async_data->media_type, async_data->title_id);
 
                 // In normal circumstances, if there is no ticket we shouldn't be able to have
                 // any contents either. However to keep compatibility with older emulator builds,
@@ -1836,14 +2409,14 @@ void Module::Interface::ListDLCContentInfos(Kernel::HLERequestContext& ctx) {
                 FileSys::Ticket ticket;
                 std::scoped_lock lock(am->am_lists_mutex);
                 auto entries = am->am_ticket_list.find(async_data->title_id);
-                if (entries != am->am_ticket_list.end() &&
-                    ticket.Load(async_data->title_id, (*entries).second) ==
-                        Loader::ResultStatus::Success) {
-                    has_ticket = true;
+                if (entries != am->am_ticket_list.end()) {
+                    ticket = GetTicket(async_data->title_id, (*entries).second);
+                    if (ticket.LoadResult() == Loader::ResultStatus::Success) {
+                        has_ticket = true;
+                    }
                 }
 
-                FileSys::TitleMetadata tmd;
-                if (tmd.Load(tmd_path) == Loader::ResultStatus::Success) {
+                if (tmd.LoadResult() == Loader::ResultStatus::Success) {
                     u32 end_index = std::min(async_data->start_index + async_data->content_count,
                                              static_cast<u32>(tmd.GetContentCount()));
                     for (u32 i = async_data->start_index; i < end_index; i++) {
@@ -1856,24 +2429,9 @@ void Module::Interface::ListDLCContentInfos(Kernel::HLERequestContext& ctx) {
                             (!has_ticket || ticket.HasRights(static_cast<u16>(i))) ? OWNERSHIP_OWNED
                                                                                    : 0;
 
-                        if (FileUtil::Exists(GetTitleContentPath(async_data->media_type,
-                                                                 async_data->title_id, i))) {
-                            bool pending = false;
-                            for (auto& import_ctx : am->import_content_contexts) {
-                                if (import_ctx.first == async_data->title_id &&
-                                    import_ctx.second.index == i &&
-                                    (import_ctx.second.state ==
-                                         ImportTitleContextState::WAITING_FOR_IMPORT ||
-                                     import_ctx.second.state ==
-                                         ImportTitleContextState::WAITING_FOR_COMMIT ||
-                                     import_ctx.second.state ==
-                                         ImportTitleContextState::RESUMABLE)) {
-                                    LOG_DEBUG(Service_AM, "content pending commit index={:016X}",
-                                              i);
-                                    pending = true;
-                                    break;
-                                }
-                            }
+                        if (TitleContentExists(async_data->media_type, async_data->title_id, i)) {
+                            const bool pending =
+                                async_data->pending_indices.contains(static_cast<u16>(i));
                             if (!pending) {
                                 content_info.ownership |= OWNERSHIP_DOWNLOADED;
                             }
@@ -1983,9 +2541,10 @@ void Module::Interface::GetProgramList(Kernel::HLERequestContext& ctx) {
     } else {
         auto& title_ids_output = rp.PopMappedBuffer();
 
-        if (media_type > 2) {
+        if (media_type >= static_cast<u8>(FS::MediaType::Count)) {
             IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
-            rb.Push<u32>(-1); // TODO(shinyquagsire23): Find the right error code
+            rb.Push<Result>(
+                ResultInvalidMediaType); // TODO(shinyquagsire23): Find the right error code
             rb.Push<u32>(0);
             return;
         }
@@ -2050,13 +2609,12 @@ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_
                       title_info.version);
             title_info_out.push_back(title_info);
         } else {
-            std::string tmd_path = GetTitleMetadataPath(media_type, title_id_list[i]);
+            FileSys::TitleMetadata tmd = GetTitleMetadata(media_type, title_id_list[i]);
 
             TitleInfo title_info = {};
             title_info.tid = title_id_list[i];
 
-            FileSys::TitleMetadata tmd;
-            if (tmd.Load(tmd_path) == Loader::ResultStatus::Success) {
+            if (tmd.LoadResult() == Loader::ResultStatus::Success) {
                 // TODO(shinyquagsire23): This is the total size of all files this process owns,
                 // including savefiles and other content. This comes close but is off.
                 title_info.size = tmd.GetContentSizeByIndex(FileSys::TMDContentIndex::Main);
@@ -2134,7 +2692,8 @@ void Module::Interface::GetProgramInfosImpl(Kernel::HLERequestContext& ctx, bool
                 }
 
                 async_data->out.resize(title_infos->second / sizeof(TitleInfo));
-                memcpy(async_data->out.data(), title_infos->first, title_infos->second);
+                memcpy(async_data->out.data(), title_infos->first,
+                       async_data->out.size() * sizeof(TitleInfo));
                 return 0;
             },
             [async_data](Kernel::HLERequestContext& ctx) {
@@ -2147,7 +2706,7 @@ void Module::Interface::GetProgramInfosImpl(Kernel::HLERequestContext& ctx, bool
                     }
                 } else {
                     async_data->title_info_out->Write(async_data->out.data(), 0,
-                                                      async_data->out.size() / sizeof(TitleInfo));
+                                                      async_data->out.size() * sizeof(TitleInfo));
 
                     IPC::RequestBuilder rb(ctx, 1, async_data->ignore_platform ? 0 : 4);
                     rb.Push(async_data->res);
@@ -2177,30 +2736,22 @@ void Module::Interface::GetProgramInfosImpl(Kernel::HLERequestContext& ctx, bool
                                                title_count * sizeof(u64));
         async_data->title_info_out = &rp.PopMappedBuffer();
 
+        // nim checks if the current importing title already exists during installation.
+        // Normally, since the program wouldn't be commited, getting the title info returns
+        // not found. However, since GetTitleInfoFromList does not care if the program was
+        // commited and only checks for the tmd, it will detect the title and return
+        // information while it shouldn't. To prevent this, we check if the importing
+        // context is present and not committed. If that's the case, return not found
+        for (auto tid : async_data->title_id_list) {
+            if (am->IsTitleImportPending(tid)) {
+                LOG_DEBUG(Service_AM, "title pending commit title_id={:016X}", tid);
+                async_data->res = Result(ErrorDescription::NotFound, ErrorModule::AM,
+                                         ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            }
+        }
+
         ctx.RunAsync(
             [this, async_data](Kernel::HLERequestContext& ctx) {
-                // nim checks if the current importing title already exists during installation.
-                // Normally, since the program wouldn't be commited, getting the title info returns
-                // not found. However, since GetTitleInfoFromList does not care if the program was
-                // commited and only checks for the tmd, it will detect the title and return
-                // information while it shouldn't. To prevent this, we check if the importing
-                // context is present and not committed. If that's the case, return not found
-                for (auto tid : async_data->title_id_list) {
-                    for (auto& import_ctx : am->import_title_contexts) {
-                        if (import_ctx.first == tid &&
-                            (import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_IMPORT ||
-                             import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_COMMIT ||
-                             import_ctx.second.state == ImportTitleContextState::RESUMABLE)) {
-                            LOG_DEBUG(Service_AM, "title pending commit title_id={:016X}", tid);
-                            async_data->res =
-                                Result(ErrorDescription::NotFound, ErrorModule::AM,
-                                       ErrorSummary::InvalidState, ErrorLevel::Permanent);
-                        }
-                    }
-                }
-
                 if (async_data->res.IsSuccess()) {
                     async_data->res = GetTitleInfoFromList(am->system, async_data->title_id_list,
                                                            async_data->media_type, async_data->out);
@@ -2237,6 +2788,10 @@ void Module::Interface::DeleteUserProgram(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_AM, "title_id={:016X}", title_id);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    if (!IsInstallableMediaType(media_type)) {
+        rb.Push(ResultInvalidMediaType);
+        return;
+    }
     u16 category = static_cast<u16>((title_id >> 32) & 0xFFFF);
     u8 variation = static_cast<u8>(title_id & 0xFF);
     if (category & CATEGORY_SYSTEM || category & CATEGORY_DLP || variation & VARIATION_SYSTEM) {
@@ -2264,11 +2819,11 @@ void Module::Interface::GetProductCode(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
     FS::MediaType media_type = rp.PopEnum<FS::MediaType>();
     u64 title_id = rp.Pop<u64>();
-    std::string path = GetTitleContentPath(media_type, title_id);
+    auto content_file = GetTitleContent(media_type, title_id, 0);
 
     LOG_DEBUG(Service_AM, "title_id={:016X}", title_id);
 
-    if (!FileUtil::Exists(path)) {
+    if (!content_file->IsOpen()) {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
         rb.Push(Result(ErrorDescription::NotFound, ErrorModule::AM, ErrorSummary::InvalidState,
                        ErrorLevel::Permanent));
@@ -2277,10 +2832,10 @@ void Module::Interface::GetProductCode(Kernel::HLERequestContext& ctx) {
             u8 code[0x10];
         };
 
-        ProductCode product_code;
+        ProductCode product_code{};
 
         IPC::RequestBuilder rb = rp.MakeBuilder(5, 0);
-        FileSys::NCCHContainer ncch(path);
+        FileSys::NCCHContainer ncch(content_file.get());
         ncch.Load();
         std::memcpy(&product_code.code, &ncch.ncch_header.product_code, 0x10);
         rb.Push(ResultSuccess);
@@ -2381,40 +2936,32 @@ void Module::Interface::GetDLCTitleInfos(Kernel::HLERequestContext& ctx) {
                                                title_count * sizeof(u64));
         async_data->title_info_out = &rp.PopMappedBuffer();
 
+        // Validate that DLC TIDs were passed in
+        for (u32 i = 0; i < async_data->title_id_list.size(); i++) {
+            u32 tid_high = static_cast<u32>(async_data->title_id_list[i] >> 32);
+            if (tid_high != TID_HIGH_DLC) {
+                async_data->res = Result(ErrCodes::InvalidTIDInList, ErrorModule::AM,
+                                         ErrorSummary::InvalidArgument, ErrorLevel::Usage);
+                break;
+            }
+        }
+
+        // nim checks if the current importing title already exists during installation.
+        // Normally, since the program wouldn't be commited, getting the title info returns
+        // not found. However, since GetTitleInfoFromList does not care if the program was
+        // commited and only checks for the tmd, it will detect the title and return
+        // information while it shouldn't. To prevent this, we check if the importing
+        // context is present and not committed. If that's the case, return not found
+        for (auto tid : async_data->title_id_list) {
+            if (am->IsTitleImportPending(tid)) {
+                LOG_DEBUG(Service_AM, "title pending commit title_id={:016X}", tid);
+                async_data->res = Result(ErrorDescription::NotFound, ErrorModule::AM,
+                                         ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            }
+        }
+
         ctx.RunAsync(
             [this, async_data](Kernel::HLERequestContext& ctx) {
-                // Validate that DLC TIDs were passed in
-                for (u32 i = 0; i < async_data->title_id_list.size(); i++) {
-                    u32 tid_high = static_cast<u32>(async_data->title_id_list[i] >> 32);
-                    if (tid_high != TID_HIGH_DLC) {
-                        async_data->res = Result(ErrCodes::InvalidTIDInList, ErrorModule::AM,
-                                                 ErrorSummary::InvalidArgument, ErrorLevel::Usage);
-                        break;
-                    }
-                }
-
-                // nim checks if the current importing title already exists during installation.
-                // Normally, since the program wouldn't be commited, getting the title info returns
-                // not found. However, since GetTitleInfoFromList does not care if the program was
-                // commited and only checks for the tmd, it will detect the title and return
-                // information while it shouldn't. To prevent this, we check if the importing
-                // context is present and not committed. If that's the case, return not found
-                for (auto tid : async_data->title_id_list) {
-                    for (auto& import_ctx : am->import_title_contexts) {
-                        if (import_ctx.first == tid &&
-                            (import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_IMPORT ||
-                             import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_COMMIT ||
-                             import_ctx.second.state == ImportTitleContextState::RESUMABLE)) {
-                            LOG_DEBUG(Service_AM, "title pending commit title_id={:016X}", tid);
-                            async_data->res =
-                                Result(ErrorDescription::NotFound, ErrorModule::AM,
-                                       ErrorSummary::InvalidState, ErrorLevel::Permanent);
-                        }
-                    }
-                }
-
                 if (async_data->res.IsSuccess()) {
                     async_data->res = GetTitleInfoFromList(am->system, async_data->title_id_list,
                                                            async_data->media_type, async_data->out);
@@ -2490,7 +3037,8 @@ void Module::Interface::GetPatchTitleInfos(Kernel::HLERequestContext& ctx) {
                 }
 
                 async_data->out.resize(title_infos->second / sizeof(TitleInfo));
-                memcpy(async_data->out.data(), title_infos->first, title_infos->second);
+                memcpy(async_data->out.data(), title_infos->first,
+                       async_data->out.size() * sizeof(TitleInfo));
                 return 0;
             },
             [async_data](Kernel::HLERequestContext& ctx) {
@@ -2528,40 +3076,32 @@ void Module::Interface::GetPatchTitleInfos(Kernel::HLERequestContext& ctx) {
                                                title_count * sizeof(u64));
         async_data->title_info_out = &rp.PopMappedBuffer();
 
+        // Validate that update TIDs were passed in
+        for (u32 i = 0; i < async_data->title_id_list.size(); i++) {
+            u32 tid_high = static_cast<u32>(async_data->title_id_list[i] >> 32);
+            if (tid_high != TID_HIGH_UPDATE) {
+                async_data->res = Result(ErrCodes::InvalidTIDInList, ErrorModule::AM,
+                                         ErrorSummary::InvalidArgument, ErrorLevel::Usage);
+                break;
+            }
+        }
+
+        // nim checks if the current importing title already exists during installation.
+        // Normally, since the program wouldn't be commited, getting the title info returns
+        // not found. However, since GetTitleInfoFromList does not care if the program was
+        // commited and only checks for the tmd, it will detect the title and return
+        // information while it shouldn't. To prevent this, we check if the importing
+        // context is present and not committed. If that's the case, return not found
+        for (auto tid : async_data->title_id_list) {
+            if (am->IsTitleImportPending(tid)) {
+                LOG_DEBUG(Service_AM, "title pending commit title_id={:016X}", tid);
+                async_data->res = Result(ErrorDescription::NotFound, ErrorModule::AM,
+                                         ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            }
+        }
+
         ctx.RunAsync(
             [this, async_data](Kernel::HLERequestContext& ctx) {
-                // Validate that update TIDs were passed in
-                for (u32 i = 0; i < async_data->title_id_list.size(); i++) {
-                    u32 tid_high = static_cast<u32>(async_data->title_id_list[i] >> 32);
-                    if (tid_high != TID_HIGH_UPDATE) {
-                        async_data->res = Result(ErrCodes::InvalidTIDInList, ErrorModule::AM,
-                                                 ErrorSummary::InvalidArgument, ErrorLevel::Usage);
-                        break;
-                    }
-                }
-
-                // nim checks if the current importing title already exists during installation.
-                // Normally, since the program wouldn't be commited, getting the title info returns
-                // not found. However, since GetTitleInfoFromList does not care if the program was
-                // commited and only checks for the tmd, it will detect the title and return
-                // information while it shouldn't. To prevent this, we check if the importing
-                // context is present and not committed. If that's the case, return not found
-                for (auto tid : async_data->title_id_list) {
-                    for (auto& import_ctx : am->import_title_contexts) {
-                        if (import_ctx.first == tid &&
-                            (import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_IMPORT ||
-                             import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_COMMIT ||
-                             import_ctx.second.state == ImportTitleContextState::RESUMABLE)) {
-                            LOG_DEBUG(Service_AM, "title pending commit title_id={:016X}", tid);
-                            async_data->res =
-                                Result(ErrorDescription::NotFound, ErrorModule::AM,
-                                       ErrorSummary::InvalidState, ErrorLevel::Permanent);
-                        }
-                    }
-                }
-
                 if (async_data->res.IsSuccess()) {
                     async_data->res = GetTitleInfoFromList(am->system, async_data->title_id_list,
                                                            async_data->media_type, async_data->out);
@@ -2666,8 +3206,8 @@ void Module::Interface::ListDataTitleTicketInfos(Kernel::HLERequestContext& ctx)
 
         u32 written = 0;
         for (; it != range.second && written < ticket_count; it++) {
-            FileSys::Ticket ticket;
-            if (ticket.Load(title_id, it->second) != Loader::ResultStatus::Success)
+            FileSys::Ticket ticket = GetTicket(title_id, it->second);
+            if (ticket.LoadResult() != Loader::ResultStatus::Success)
                 continue;
 
             TicketInfo info = {};
@@ -2756,10 +3296,8 @@ void Module::Interface::GetDLCContentInfoCount(Kernel::HLERequestContext& ctx) {
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
         rb.Push(ResultSuccess); // No error
 
-        std::string tmd_path = GetTitleMetadataPath(media_type, title_id);
-
-        FileSys::TitleMetadata tmd;
-        if (tmd.Load(tmd_path) == Loader::ResultStatus::Success) {
+        FileSys::TitleMetadata tmd = GetTitleMetadata(media_type, title_id);
+        if (tmd.LoadResult() == Loader::ResultStatus::Success) {
             rb.Push<u32>(static_cast<u32>(tmd.GetContentCount()));
         } else {
             rb.Push<u32>(1); // Number of content infos plus one
@@ -2783,15 +3321,22 @@ void Module::Interface::DeleteTicket(Kernel::HLERequestContext& ctx) {
                        ErrorLevel::Success));
         return;
     }
-    auto it = range.first;
-    for (; it != range.second; it++) {
+    bool found = false;
+    for (auto it = range.first; it != range.second;) {
         auto path = GetTicketPath(title_id, it->second);
-        FileUtil::Delete(path);
+
+        if (FileUtil::Exists(path)) {
+            FileUtil::Delete(path);
+            it = am->am_ticket_list.erase(it);
+            found = true;
+        } else {
+            ++it;
+        }
     }
 
-    am->am_ticket_list.erase(range.first, range.second);
-
-    rb.Push(ResultSuccess);
+    rb.Push(found ? ResultSuccess
+                  : Result(ErrorDescription::NotFound, ErrorModule::AM, ErrorSummary::NotFound,
+                           ErrorLevel::Permanent));
 }
 
 void Module::Interface::GetNumTickets(Kernel::HLERequestContext& ctx) {
@@ -3181,9 +3726,8 @@ void Module::Interface::GetPersonalizedTicketInfoList(Kernel::HLERequestContext&
                 if ((tid_high & 0x00048010) == 0x00040010 || (tid_high & 0x00048001) == 0x00048001)
                     continue;
 
-                FileSys::Ticket ticket;
-                if (ticket.Load(title_id, it->second) != Loader::ResultStatus::Success ||
-                    !ticket.IsPersonal())
+                FileSys::Ticket ticket = GetTicket(title_id, it->second);
+                if (ticket.LoadResult() != Loader::ResultStatus::Success || !ticket.IsPersonal())
                     continue;
 
                 TicketInfo info = {};
@@ -3247,9 +3791,11 @@ void Module::Interface::CheckContentRights(Kernel::HLERequestContext& ctx) {
     FileSys::Ticket ticket;
     std::scoped_lock lock(am->am_lists_mutex);
     auto entries = am->am_ticket_list.find(tid);
-    if (entries != am->am_ticket_list.end() &&
-        ticket.Load(tid, (*entries).second) == Loader::ResultStatus::Success) {
-        has_ticket = true;
+    if (entries != am->am_ticket_list.end()) {
+        ticket = GetTicket(tid, (*entries).second);
+        if (ticket.LoadResult() == Loader::ResultStatus::Success) {
+            has_ticket = true;
+        }
     }
 
     bool has_rights = (!has_ticket || ticket.HasRights(content_index));
@@ -3270,9 +3816,11 @@ void Module::Interface::CheckContentRightsIgnorePlatform(Kernel::HLERequestConte
     FileSys::Ticket ticket;
     std::scoped_lock lock(am->am_lists_mutex);
     auto entries = am->am_ticket_list.find(tid);
-    if (entries != am->am_ticket_list.end() &&
-        ticket.Load(tid, (*entries).second) == Loader::ResultStatus::Success) {
-        has_ticket = true;
+    if (entries != am->am_ticket_list.end()) {
+        ticket = GetTicket(tid, (*entries).second);
+        if (ticket.LoadResult() == Loader::ResultStatus::Success) {
+            has_ticket = true;
+        }
     }
 
     bool has_rights = (!has_ticket || ticket.HasRights(content_index));
@@ -3402,6 +3950,12 @@ ResultVal<T*> GetFileBackendFromSession(std::shared_ptr<Kernel::ClientSession> f
 void Module::Interface::BeginImportProgram(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
     auto media_type = static_cast<Service::FS::MediaType>(rp.Pop<u8>());
+
+    if (!IsInstallableMediaType(media_type)) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultInvalidMediaType);
+        return;
+    }
 
     if (am->cia_installing) {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
@@ -3728,8 +4282,14 @@ void Module::Interface::CommitImportTitlesImpl(Kernel::HLERequestContext& ctx,
 
     auto& title_id_buf = rp.PopMappedBuffer();
 
+    if (media_type >= FS::MediaType::Count) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultInvalidMediaType);
+        return;
+    }
+
     std::vector<u64> title_ids(title_id_buf.GetSize() / sizeof(u64));
-    title_id_buf.Read(title_ids.data(), 0, title_id_buf.GetSize());
+    title_id_buf.Read(title_ids.data(), 0, title_ids.size() * sizeof(u64));
 
     for (auto& key_value : am->import_content_contexts) {
         if (std::find(title_ids.begin(), title_ids.end(), key_value.first) != title_ids.end() &&
@@ -3776,6 +4336,9 @@ void Module::Interface::CommitImportTitlesImpl(Kernel::HLERequestContext& ctx,
 }
 
 Result UninstallProgram(const FS::MediaType media_type, const u64 title_id) {
+    if (!IsInstallableMediaType(media_type)) {
+        return ResultInvalidMediaType;
+    }
     // Use the content folder so we don't delete the user's save data.
     const auto path = GetTitlePath(media_type, title_id) + "content/";
     if (!FileUtil::Exists(path)) {
@@ -3907,24 +4470,32 @@ void Module::Interface::EndImportTicket(Kernel::HLERequestContext& ctx) {
     auto ticket_file = GetFileBackendFromSession<TicketFile>(ticket);
     if (ticket_file.Succeeded()) {
         struct AsyncData {
-            Service::AM::TicketFile* ticket_file;
+            std::vector<u8> ticket_data;
+            bool do_signature_checks;
 
             Result res{0};
         };
         std::shared_ptr<AsyncData> async_data = std::make_shared<AsyncData>();
-        async_data->ticket_file = ticket_file.Unwrap();
+        // The ticket file can still be written to or closed while the ticket is being
+        // installed, so work on a copy of its data.
+        async_data->ticket_data = ticket_file.Unwrap()->GetData();
+        async_data->do_signature_checks = IsCallerAuthorizedToDecrypt(ctx);
 
         ctx.RunAsync(
             [this, async_data](Kernel::HLERequestContext& ctx) {
-                async_data->res = async_data->ticket_file->Commit();
+                auto commit_result =
+                    TicketFile::Commit(async_data->ticket_data, async_data->do_signature_checks);
+                if (commit_result.Failed()) {
+                    async_data->res = commit_result.Code();
+                    return 0;
+                }
+                const auto [title_id, ticket_id] = commit_result.Unwrap();
 
                 std::scoped_lock lock(am->am_lists_mutex);
-                am->am_ticket_list.insert(std::make_pair(async_data->ticket_file->GetTitleID(),
-                                                         async_data->ticket_file->GetTicketID()));
+                am->am_ticket_list.insert(std::make_pair(title_id, ticket_id));
 
                 LOG_DEBUG(Service_AM, "EndImportTicket: title_id={:016X} ticket_id={:016X}",
-                          async_data->ticket_file->GetTitleID(),
-                          async_data->ticket_file->GetTicketID());
+                          title_id, ticket_id);
                 return 0;
             },
             [async_data](Kernel::HLERequestContext& ctx) {
@@ -3948,24 +4519,44 @@ void Module::Interface::BeginImportTitle(Kernel::HLERequestContext& ctx) {
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
 
+    if (!IsInstallableMediaType(media_type)) {
+        rb.Push(ResultInvalidMediaType);
+        return;
+    }
+
     am->importing_title =
         std::make_shared<CurrentImportingTitle>(Core::System::GetInstance(), title_id, media_type);
 
     std::scoped_lock lock(am->am_lists_mutex);
-    auto entries = am->am_ticket_list.find(title_id);
-    if (entries == am->am_ticket_list.end()) {
-        // Ticket is not installed
-        rb.Push(ResultUnknown);
-        return;
+    const bool do_signature_checks = IsCallerAuthorizedToDecrypt(ctx);
+    std::optional<FileSys::Ticket> ticket;
+    Result check_result = ResultUnknown;
+    const auto range = am->am_ticket_list.equal_range(title_id);
+    for (auto it = range.first; it != range.second && !ticket; it++) {
+        FileSys::Ticket candidate;
+        if (candidate.Load(title_id, it->second) != Loader::ResultStatus::Success) {
+            continue;
+        }
+        if (do_signature_checks) {
+            // On hardware, the ticket is checked again whenever it is used. A title can
+            // have several tickets (for example, one installed earlier from a CIA), so
+            // here we iterate all tickets and use the one that verifies.
+            check_result = VerifyTicket(candidate);
+            if (check_result.IsError()) {
+                LOG_WARNING(Service_AM, "Installed ticket {:016X} of {:016X} does not verify",
+                            it->second, title_id);
+                continue;
+            }
+        }
+        ticket = std::move(candidate);
     }
-    FileSys::Ticket ticket;
-    if (ticket.Load(title_id, (*entries).second) != Loader::ResultStatus::Success) {
-        // Ticket failed to load
-        rb.Push(ResultUnknown);
+    if (!ticket) {
+        // No valid ticket is installed
+        rb.Push(do_signature_checks ? check_result : ResultUnknown);
         return;
     }
 
-    Result res = am->importing_title->cia_file.ProvideTicket(ticket);
+    Result res = am->importing_title->cia_file.ProvideTicket(*ticket);
     if (res.IsError()) {
         // Failed to load ticket
         rb.Push(res);
@@ -4114,28 +4705,65 @@ void Module::Interface::EndImportTmd(Kernel::HLERequestContext& ctx) {
 
     auto tmd_file = GetFileBackendFromSession<TMDFile>(tmd);
     if (tmd_file.Succeeded()) {
-        struct AsyncData {
-            Service::AM::TMDFile* tmd_file;
-            [[maybe_unused]] bool create_context;
+        if (tmd_file.Unwrap()->GetImportingTitle() != am->importing_title ||
+            am->importing_title->tmd_import_pending) {
+            IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+            rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM,
+                           ErrorSummary::InvalidState, ErrorLevel::Permanent));
+            return;
+        }
 
-            Result res{0};
+        struct AsyncData {
+            std::shared_ptr<CurrentImportingTitle> importing_title;
+            Service::FS::MediaType media_type;
+            bool is_update;
+            std::vector<u8> tmd_data;
+            [[maybe_unused]] bool create_context;
+            bool do_signature_checks;
+
+            CIAFile::PreparedTitleMetadata prepared;
         };
         std::shared_ptr<AsyncData> async_data = std::make_shared<AsyncData>();
-        async_data->tmd_file = tmd_file.Unwrap();
+        async_data->importing_title = am->importing_title;
+        async_data->media_type = am->importing_title->media_type;
+        async_data->is_update = am->importing_title->cia_file.IsUpdate();
+        async_data->tmd_data = tmd_file.Unwrap()->GetData();
         async_data->create_context = create_context;
+        async_data->do_signature_checks = am->importing_title->cia_file.SignatureChecksEnabed();
 
+        // Saving the TMD and preparing the content folders is done asynchronously, as it
+        // involves host file system operations. The importing title is only modified in the
+        // result function, which runs on the emulation thread. Until then, other requests
+        // that depend on the TMD are rejected.
+        async_data->importing_title->tmd_import_pending = true;
         ctx.RunAsync(
             [async_data](Kernel::HLERequestContext& ctx) {
-                async_data->res = async_data->tmd_file->Commit();
+                async_data->prepared = CIAFile::PrepareTitleMetadata(
+                    async_data->media_type, async_data->is_update, async_data->tmd_data, 0,
+                    async_data->do_signature_checks);
                 return 0;
             },
             [this, async_data](Kernel::HLERequestContext& ctx) {
-                IPC::RequestBuilder rb(ctx, 1, 0);
-                rb.Push(async_data->res);
+                const auto& importing_title = async_data->importing_title;
+                importing_title->tmd_import_pending = false;
 
-                if (async_data->res.IsSuccess()) {
-                    am->importing_title->tmd_provided = true;
-                    const FileSys::TitleMetadata& tmd_info = am->importing_title->cia_file.GetTMD();
+                IPC::RequestBuilder rb(ctx, 1, 0);
+
+                // The import may have been cancelled or replaced in the meantime.
+                if (am->importing_title != importing_title) {
+                    rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM,
+                                   ErrorSummary::InvalidState, ErrorLevel::Permanent));
+                    return;
+                }
+
+                const Result res =
+                    importing_title->cia_file.ApplyTitleMetadata(std::move(async_data->prepared))
+                        .result;
+                rb.Push(res);
+
+                if (res.IsSuccess()) {
+                    importing_title->tmd_provided = true;
+                    const FileSys::TitleMetadata& tmd_info = importing_title->cia_file.GetTMD();
 
                     ImportTitleContext& context = am->import_title_contexts[tmd_info.GetTitleID()];
                     context.title_id = tmd_info.GetTitleID();
@@ -4147,7 +4775,7 @@ void Module::Interface::EndImportTmd(Kernel::HLERequestContext& ctx) {
                         if (tmd_info.GetContentOptional(i)) {
                             continue;
                         }
-                        ImportContentContext content_context;
+                        ImportContentContext content_context{};
                         content_context.content_id = tmd_info.GetContentIDByIndex(i);
                         content_context.index = static_cast<u16>(i);
                         content_context.state = ImportTitleContextState::WAITING_FOR_IMPORT;
@@ -4183,57 +4811,115 @@ void Module::Interface::CreateImportContentContexts(Kernel::HLERequestContext& c
         return;
     }
 
+    if (static_cast<std::size_t>(content_count) * sizeof(u16) > content_buf.GetSize()) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(Result(ErrorDescription::InvalidSize, ErrorModule::AM,
+                       ErrorSummary::InvalidArgument, ErrorLevel::Usage));
+        return;
+    }
+
     struct AsyncData {
         std::vector<u16> content_indices;
+        std::shared_ptr<CurrentImportingTitle> importing_title;
+        Service::FS::MediaType media_type;
+        u64 title_id;
+        bool is_update;
+        bool load_tmd;
+        bool do_signature_checks;
 
+        std::optional<CIAFile::PreparedTitleMetadata> prepared;
         Result res{0};
     };
     std::shared_ptr<AsyncData> async_data = std::make_shared<AsyncData>();
     async_data->content_indices.resize(content_count);
-    content_buf.Read(async_data->content_indices.data(), 0, content_buf.GetSize());
+    content_buf.Read(async_data->content_indices.data(), 0,
+                     async_data->content_indices.size() * sizeof(u16));
+
+    if (am->importing_title->tmd_import_pending) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
+                       ErrorLevel::Permanent));
+        return;
+    }
+
+    async_data->importing_title = am->importing_title;
+    async_data->media_type = am->importing_title->media_type;
+    async_data->title_id = am->importing_title->title_id;
+    async_data->is_update = am->importing_title->cia_file.IsUpdate();
+    async_data->load_tmd = !am->importing_title->tmd_provided;
+    async_data->do_signature_checks = am->importing_title->cia_file.SignatureChecksEnabed();
+    if (async_data->load_tmd) {
+        async_data->importing_title->tmd_import_pending = true;
+    }
 
     ctx.RunAsync(
-        [this, async_data](Kernel::HLERequestContext& ctx) {
-            if (!am->importing_title->tmd_provided) {
-                std::string tmd_path = GetTitleMetadataPath(am->importing_title->media_type,
-                                                            am->importing_title->title_id);
+        [async_data](Kernel::HLERequestContext& ctx) {
+            if (async_data->load_tmd) {
+                std::string tmd_path =
+                    GetTitleMetadataPath(async_data->media_type, async_data->title_id);
                 FileSys::TitleMetadata tmd;
                 if (tmd.Load(tmd_path) != Loader::ResultStatus::Success) {
                     LOG_ERROR(Service_AM, "Couldn't load TMD for title_id={:016X}, mediatype={}",
-                              am->importing_title->title_id, am->importing_title->media_type);
+                              async_data->title_id, async_data->media_type);
 
                     async_data->res =
                         Result(0xFFFFFFFF); // TODO(PabloMK7): Find the right error code
                     return 0;
                 }
-                am->importing_title->cia_file.ProvideTMDForAdditionalContent(tmd);
-                am->importing_title->tmd_provided = true;
+                async_data->prepared = CIAFile::PrepareAdditionalContent(
+                    async_data->media_type, async_data->is_update, std::move(tmd),
+                    async_data->do_signature_checks);
             }
-            const FileSys::TitleMetadata& tmd = am->importing_title->cia_file.GetTMD();
+            return 0;
+        },
+        [this, async_data](Kernel::HLERequestContext& ctx) {
+            if (async_data->load_tmd) {
+                async_data->importing_title->tmd_import_pending = false;
+            }
+
+            IPC::RequestBuilder rb(ctx, 1, 0);
+            if (async_data->res.IsError()) {
+                rb.Push(async_data->res);
+                return;
+            }
+
+            // The import may have been cancelled or replaced in the meantime.
+            const auto& importing_title = async_data->importing_title;
+            if (am->importing_title != importing_title) {
+                rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM,
+                               ErrorSummary::InvalidState, ErrorLevel::Permanent));
+                return;
+            }
+
+            if (async_data->prepared && !importing_title->tmd_provided) {
+                const Result res = importing_title->cia_file.ApplyAdditionalContent(
+                    std::move(*async_data->prepared));
+                if (res.IsError()) {
+                    rb.Push(res);
+                    return;
+                }
+                importing_title->tmd_provided = true;
+            }
+            const FileSys::TitleMetadata& tmd = importing_title->cia_file.GetTMD();
             for (size_t i = 0; i < async_data->content_indices.size(); i++) {
                 u16 index = async_data->content_indices[i];
-                if (index > tmd.GetContentCount()) {
+                if (index >= tmd.GetContentCount()) {
                     LOG_ERROR(Service_AM,
                               "Tried to create context for invalid index title_id={:016x} index={}",
-                              am->importing_title->title_id, index);
-                    async_data->res =
-                        Result(0xFFFFFFFF); // TODO(PabloMK7): Find the right error code
-                    return 0;
+                              importing_title->title_id, index);
+                    rb.Push(Result(0xFFFFFFFF)); // TODO(PabloMK7): Find the right error code
+                    return;
                 }
-                ImportContentContext content_context;
+                ImportContentContext content_context{};
                 content_context.content_id = tmd.GetContentIDByIndex(index);
                 content_context.index = static_cast<u16>(index);
                 content_context.state = ImportTitleContextState::WAITING_FOR_IMPORT;
                 content_context.size = tmd.GetContentSizeByIndex(index);
                 content_context.current_size = 0;
                 am->import_content_contexts.insert(
-                    std::make_pair(am->importing_title->title_id, content_context));
+                    std::make_pair(importing_title->title_id, content_context));
             }
-            return 0;
-        },
-        [async_data](Kernel::HLERequestContext& ctx) {
-            IPC::RequestBuilder rb(ctx, 1, 0);
-            rb.Push(async_data->res);
+            rb.Push(ResultSuccess);
         },
         true);
 }
@@ -4267,8 +4953,7 @@ void Module::Interface::BeginImportContent(Kernel::HLERequestContext& ctx) {
 
     // Create our TMD handle for the app to write to
     auto file = std::make_shared<Service::FS::File>(
-        am->system.Kernel(),
-        std::make_unique<ContentFile>(am->importing_title, content_index, it->second),
+        am->system.Kernel(), std::make_unique<ContentFile>(am, am->importing_title, content_index),
         FileSys::Path{});
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
@@ -4305,8 +4990,7 @@ void Module::Interface::ResumeImportContent(Kernel::HLERequestContext& ctx) {
 
     it->second.state = ImportTitleContextState::WAITING_FOR_IMPORT;
 
-    auto content_file =
-        std::make_unique<ContentFile>(am->importing_title, content_index, it->second);
+    auto content_file = std::make_unique<ContentFile>(am, am->importing_title, content_index);
     content_file->SetWritten(it->second.current_size);
 
     // Create our TMD handle for the app to write to
@@ -4338,7 +5022,9 @@ void Module::Interface::StopImportContent(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    content_file.Unwrap()->GetImportContext().state = ImportTitleContextState::RESUMABLE;
+    if (auto context = content_file.Unwrap()->GetImportContext()) {
+        context->state = ImportTitleContextState::RESUMABLE;
+    }
 
     rb.Push(ResultSuccess);
 }
@@ -4362,7 +5048,9 @@ void Module::Interface::CancelImportContent(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    content_file.Unwrap()->GetImportContext().state = ImportTitleContextState::DELETING;
+    if (auto context = content_file.Unwrap()->GetImportContext()) {
+        context->state = ImportTitleContextState::DELETING;
+    }
     content_file.Unwrap()->Cancel(am->importing_title->media_type, am->importing_title->title_id);
 
     rb.Push(ResultSuccess);
@@ -4387,7 +5075,23 @@ void Module::Interface::EndImportContent(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    content_file.Unwrap()->GetImportContext().state = ImportTitleContextState::WAITING_FOR_COMMIT;
+    auto& cia_file = am->importing_title->cia_file;
+    if (cia_file.SignatureChecksEnabed()) {
+        const Result verify_result = cia_file.VerifyContent(content_file.Unwrap()->GetIndex());
+        if (verify_result.IsError()) {
+            if (auto context = content_file.Unwrap()->GetImportContext()) {
+                context->state = ImportTitleContextState::DELETING;
+            }
+            content_file.Unwrap()->Cancel(am->importing_title->media_type,
+                                          am->importing_title->title_id);
+            rb.Push(verify_result);
+            return;
+        }
+    }
+
+    if (auto context = content_file.Unwrap()->GetImportContext()) {
+        context->state = ImportTitleContextState::WAITING_FOR_COMMIT;
+    }
 
     rb.Push(ResultSuccess);
 }
@@ -4527,6 +5231,45 @@ void Module::Interface::GetDeviceCert(Kernel::HLERequestContext& ctx) {
     rb.PushMappedBuffer(buffer);
 }
 
+void Module::Interface::ImportCertificates(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    std::array<u32, 4> sizes;
+    for (auto& size : sizes) {
+        size = rp.Pop<u32>();
+    }
+    std::vector<u8> data;
+    std::array<Kernel::MappedBuffer*, 4> buffers;
+    for (std::size_t i = 0; i < buffers.size(); i++) {
+        buffers[i] = &rp.PopMappedBuffer();
+        const std::size_t size = std::min<std::size_t>(sizes[i], buffers[i]->GetSize());
+        const std::size_t start = data.size();
+        data.resize(start + size);
+        buffers[i]->Read(data.data() + start, 0, size);
+    }
+
+    LOG_DEBUG(Service_AM, "sizes={:#x} {:#x} {:#x} {:#x}", sizes[0], sizes[1], sizes[2], sizes[3]);
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 8);
+    rb.Push(Service::AM::ImportCertificates(data));
+    for (auto* buffer : buffers) {
+        rb.PushMappedBuffer(*buffer);
+    }
+}
+
+void Module::Interface::ImportCertificate(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const u32 size = rp.Pop<u32>();
+    auto& buffer = rp.PopMappedBuffer();
+    std::vector<u8> data(std::min<std::size_t>(size, buffer.GetSize()));
+    buffer.Read(data.data(), 0, data.size());
+
+    LOG_DEBUG(Service_AM, "size={:#x}", size);
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+    rb.Push(Service::AM::ImportCertificates(data));
+    rb.PushMappedBuffer(buffer);
+}
+
 void Module::Interface::CommitImportTitlesAndUpdateFirmwareAuto(Kernel::HLERequestContext& ctx) {
     CommitImportTitlesImpl(ctx, true, true);
 }
@@ -4547,18 +5290,23 @@ void Module::Interface::DeleteTicketId(Kernel::HLERequestContext& ctx) {
             break;
         }
     }
-    if (range.first == range.second) {
+    if (it == range.second) {
         rb.Push(Result(ErrorDescription::AlreadyDone, ErrorModule::AM, ErrorSummary::Success,
                        ErrorLevel::Success));
         return;
     }
 
     auto path = GetTicketPath(title_id, ticket_id);
-    FileUtil::Delete(path);
+    bool found = false;
+    if (FileUtil::Exists(path)) {
+        FileUtil::Delete(path);
+        am->am_ticket_list.erase(it);
+        found = true;
+    }
 
-    am->am_ticket_list.erase(it);
-
-    rb.Push(ResultSuccess);
+    rb.Push(found ? ResultSuccess
+                  : Result(ErrorDescription::NotFound, ErrorModule::AM, ErrorSummary::NotFound,
+                           ErrorLevel::Permanent));
 }
 
 void Module::Interface::GetNumTicketIds(Kernel::HLERequestContext& ctx) {
@@ -4631,8 +5379,8 @@ void Module::Interface::ListTicketInfos(Kernel::HLERequestContext& ctx) {
 
     u32 written = 0;
     for (; it != range.second && written < ticket_count; it++) {
-        FileSys::Ticket ticket;
-        if (ticket.Load(title_id, it->second) != Loader::ResultStatus::Success)
+        FileSys::Ticket ticket = GetTicket(title_id, it->second);
+        if (ticket.LoadResult() != Loader::ResultStatus::Success)
             continue;
 
         TicketInfo info = {};
@@ -4680,66 +5428,59 @@ void Module::Interface::FindCurrentContentInfos(Kernel::HLERequestContext& ctx) 
     }
 
     struct AsyncData {
-        u32 content_count;
-        std::vector<u16_le> content_requested;
+        Service::FS::MediaType media_type;
+        u64 title_id;
+        std::set<u16> pending_indices;
 
         std::vector<ContentInfo> out_vec;
         Kernel::MappedBuffer* content_info_out;
         Result res{0};
     };
     auto async_data = std::make_shared<AsyncData>();
-    async_data->content_count = rp.Pop<u32>();
+    const u32 content_count = rp.Pop<u32>();
 
     auto& content_requested_in = rp.PopMappedBuffer();
-    async_data->content_requested.resize(async_data->content_count);
-    content_requested_in.Read(async_data->content_requested.data(), 0,
-                              async_data->content_count * sizeof(u16));
+    std::vector<u16_le> content_requested(content_count);
+    content_requested_in.Read(content_requested.data(), 0, content_count * sizeof(u16));
     async_data->content_info_out = &rp.PopMappedBuffer();
 
+    async_data->media_type = am->importing_title->media_type;
+    async_data->title_id = am->importing_title->title_id;
+    async_data->pending_indices = am->GetPendingImportContentIndices(async_data->title_id);
+
+    const FileSys::TitleMetadata& tmd = am->importing_title->cia_file.GetTMD();
+    FileSys::Ticket& ticket = am->importing_title->cia_file.GetTicket();
+    // Get info for each content index requested
+    for (const u16 index : content_requested) {
+        if (index >= tmd.GetContentCount()) {
+            LOG_ERROR(Service_AM, "Attempted to get info for non-existent content index {:04x}.",
+                      index);
+
+            async_data->res = Result(0xFFFFFFFF);
+            break;
+        }
+
+        ContentInfo content_info = {};
+        content_info.index = index;
+        content_info.type = tmd.GetContentTypeByIndex(index);
+        content_info.content_id = tmd.GetContentIDByIndex(index);
+        content_info.size = tmd.GetContentSizeByIndex(index);
+        content_info.ownership = ticket.HasRights(index) ? OWNERSHIP_OWNED : 0;
+        async_data->out_vec.push_back(content_info);
+    }
+
     ctx.RunAsync(
-        [this, async_data](Kernel::HLERequestContext& ctx) {
-            const FileSys::TitleMetadata& tmd = am->importing_title->cia_file.GetTMD();
-            FileSys::Ticket& ticket = am->importing_title->cia_file.GetTicket();
-            // Get info for each content index requested
-            for (std::size_t i = 0; i < async_data->content_count; i++) {
-                u16_le index = async_data->content_requested[i];
-                if (index >= tmd.GetContentCount()) {
-                    LOG_ERROR(Service_AM,
-                              "Attempted to get info for non-existent content index {:04x}.",
-                              index);
-
-                    async_data->res = Result(0xFFFFFFFF);
-                    return 0;
+        [async_data](Kernel::HLERequestContext& ctx) {
+            if (async_data->res.IsError()) {
+                return 0;
+            }
+            for (auto& content_info : async_data->out_vec) {
+                const u16 index = content_info.index;
+                if (FileUtil::Exists(
+                        GetTitleContentPath(async_data->media_type, async_data->title_id, index)) &&
+                    !async_data->pending_indices.contains(index)) {
+                    content_info.ownership |= OWNERSHIP_DOWNLOADED;
                 }
-
-                ContentInfo content_info = {};
-                content_info.index = index;
-                content_info.type = tmd.GetContentTypeByIndex(index);
-                content_info.content_id = tmd.GetContentIDByIndex(index);
-                content_info.size = tmd.GetContentSizeByIndex(index);
-                content_info.ownership = ticket.HasRights(index) ? OWNERSHIP_OWNED : 0;
-
-                if (FileUtil::Exists(GetTitleContentPath(am->importing_title->media_type,
-                                                         am->importing_title->title_id, index))) {
-                    bool pending = false;
-                    for (auto& import_ctx : am->import_content_contexts) {
-                        if (import_ctx.first == am->importing_title->title_id &&
-                            import_ctx.second.index == index &&
-                            (import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_IMPORT ||
-                             import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_COMMIT ||
-                             import_ctx.second.state == ImportTitleContextState::RESUMABLE)) {
-                            LOG_DEBUG(Service_AM, "content pending commit index={:016X}", index);
-                            pending = true;
-                            break;
-                        }
-                    }
-                    if (!pending) {
-                        content_info.ownership |= OWNERSHIP_DOWNLOADED;
-                    }
-                }
-                async_data->out_vec.push_back(content_info);
             }
             return 0;
         },
@@ -4768,56 +5509,46 @@ void Module::Interface::ListCurrentContentInfos(Kernel::HLERequestContext& ctx) 
     }
 
     struct AsyncData {
-        u32 content_count;
-        u32 start_index;
+        Service::FS::MediaType media_type;
+        u64 title_id;
+        std::set<u16> pending_indices;
 
         std::vector<ContentInfo> out_vec;
         Kernel::MappedBuffer* content_info_out;
         Result res{0};
     };
     auto async_data = std::make_shared<AsyncData>();
-    async_data->content_count = rp.Pop<u32>();
-    async_data->start_index = rp.Pop<u32>();
+    const u32 content_count = rp.Pop<u32>();
+    const u32 start_index = rp.Pop<u32>();
 
     async_data->content_info_out = &rp.PopMappedBuffer();
 
+    async_data->media_type = am->importing_title->media_type;
+    async_data->title_id = am->importing_title->title_id;
+    async_data->pending_indices = am->GetPendingImportContentIndices(async_data->title_id);
+
+    const FileSys::TitleMetadata& tmd = am->importing_title->cia_file.GetTMD();
+    FileSys::Ticket& ticket = am->importing_title->cia_file.GetTicket();
+    u32 end_index = std::min(start_index + content_count, static_cast<u32>(tmd.GetContentCount()));
+    for (u32 i = start_index; i < end_index; i++) {
+        ContentInfo content_info = {};
+        content_info.index = static_cast<u16>(i);
+        content_info.type = tmd.GetContentTypeByIndex(i);
+        content_info.content_id = tmd.GetContentIDByIndex(i);
+        content_info.size = tmd.GetContentSizeByIndex(i);
+        content_info.ownership = ticket.HasRights(static_cast<u16>(i)) ? OWNERSHIP_OWNED : 0;
+        async_data->out_vec.push_back(content_info);
+    }
+
     ctx.RunAsync(
-        [this, async_data](Kernel::HLERequestContext& ctx) {
-            const FileSys::TitleMetadata& tmd = am->importing_title->cia_file.GetTMD();
-            FileSys::Ticket& ticket = am->importing_title->cia_file.GetTicket();
-            u32 end_index = std::min(async_data->start_index + async_data->content_count,
-                                     static_cast<u32>(tmd.GetContentCount()));
-            for (u32 i = async_data->start_index; i < end_index; i++) {
-                ContentInfo content_info = {};
-                content_info.index = static_cast<u16>(i);
-                content_info.type = tmd.GetContentTypeByIndex(i);
-                content_info.content_id = tmd.GetContentIDByIndex(i);
-                content_info.size = tmd.GetContentSizeByIndex(i);
-                content_info.ownership =
-                    ticket.HasRights(static_cast<u16>(i)) ? OWNERSHIP_OWNED : 0;
-
-                if (FileUtil::Exists(GetTitleContentPath(am->importing_title->media_type,
-                                                         am->importing_title->title_id, i))) {
-                    bool pending = false;
-                    for (auto& import_ctx : am->import_content_contexts) {
-                        if (import_ctx.first == am->importing_title->title_id &&
-                            import_ctx.second.index == i &&
-                            (import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_IMPORT ||
-                             import_ctx.second.state ==
-                                 ImportTitleContextState::WAITING_FOR_COMMIT ||
-                             import_ctx.second.state == ImportTitleContextState::RESUMABLE)) {
-                            LOG_DEBUG(Service_AM, "content pending commit index={:016X}", i);
-                            pending = true;
-                            break;
-                        }
-                    }
-                    if (!pending) {
-                        content_info.ownership |= OWNERSHIP_DOWNLOADED;
-                    }
+        [async_data](Kernel::HLERequestContext& ctx) {
+            for (auto& content_info : async_data->out_vec) {
+                const u16 index = content_info.index;
+                if (FileUtil::Exists(
+                        GetTitleContentPath(async_data->media_type, async_data->title_id, index)) &&
+                    !async_data->pending_indices.contains(index)) {
+                    content_info.ownership |= OWNERSHIP_DOWNLOADED;
                 }
-
-                async_data->out_vec.push_back(content_info);
             }
             return 0;
         },
@@ -4891,7 +5622,8 @@ void Module::Interface::UpdateImportContentContexts(Kernel::HLERequestContext& c
     auto content_buf = rp.PopMappedBuffer();
 
     std::vector<u16> content_indices(content_count);
-    content_buf.Read(content_indices.data(), 0, content_buf.GetSize());
+    content_buf.Read(content_indices.data(), 0,
+                     std::min(content_indices.size() * sizeof(u16), content_buf.GetSize()));
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
@@ -4934,16 +5666,17 @@ void Module::Interface::ExportTicketWrapped(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    FileSys::Ticket ticket;
-    if (ticket.Load(title_id, ticket_id) != Loader::ResultStatus::Success) {
+    FileSys::Ticket ticket = GetTicket(title_id, ticket_id);
+    if (ticket.LoadResult() != Loader::ResultStatus::Success) {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
         rb.Push(Result(ErrorDescription::NotFound, ErrorModule::AM, ErrorSummary::InvalidState,
                        ErrorLevel::Permanent));
         return;
     }
 
-    std::vector<u8> ticket_data(Common::AlignUp(ticket.GetSerializedSize(), 0x10));
-    memcpy(ticket_data.data(), ticket.Serialize().data(), ticket.GetSerializedSize());
+    const std::vector<u8> serialized_ticket = ticket.Serialize();
+    std::vector<u8> ticket_data(Common::AlignUp(serialized_ticket.size(), 0x10));
+    memcpy(ticket_data.data(), serialized_ticket.data(), serialized_ticket.size());
 
     std::vector<u8> key(0x10);
     std::vector<u8> iv(0x10);
@@ -4984,9 +5717,42 @@ void Module::Interface::ExportTicketWrapped(Kernel::HLERequestContext& ctx) {
     rb.Push(static_cast<u32>(rsa_out.size()));
 }
 
+ImportContentContext* Module::FindImportContentContext(u64 title_id, u16 index) {
+    auto range = import_content_contexts.equal_range(title_id);
+    for (auto it = range.first; it != range.second; it++) {
+        if (it->second.index == index) {
+            return &it->second;
+        }
+    }
+    return nullptr;
+}
+
+static bool IsImportPending(ImportTitleContextState state) {
+    return state == ImportTitleContextState::WAITING_FOR_IMPORT ||
+           state == ImportTitleContextState::WAITING_FOR_COMMIT ||
+           state == ImportTitleContextState::RESUMABLE;
+}
+
+std::set<u16> Module::GetPendingImportContentIndices(u64 title_id) const {
+    std::set<u16> indices;
+    auto range = import_content_contexts.equal_range(title_id);
+    for (auto it = range.first; it != range.second; it++) {
+        if (IsImportPending(it->second.state)) {
+            indices.insert(it->second.index);
+        }
+    }
+    return indices;
+}
+
+bool Module::IsTitleImportPending(u64 title_id) const {
+    auto it = import_title_contexts.find(title_id);
+    return it != import_title_contexts.end() && IsImportPending(it->second.state);
+}
+
 Module::Module(Core::System& _system) : system(_system) {
     FileUtil::CreateFullPath(GetTicketDirectory());
-    ScanForAllTitles();
+    EnsureDefaultCertificates();
+    bundle_cia_handler = std::make_unique<BundleCIAHandler>();
     system_updater_mutex = system.Kernel().CreateMutex(false, "AM::SystemUpdaterMutex");
 }
 
@@ -4995,6 +5761,10 @@ Module::~Module() {
 }
 
 std::shared_ptr<Module> GetModule(Core::System& system) {
+    if (!system.IsPoweredOn()) {
+        return nullptr;
+    }
+
     auto am = system.ServiceManager().GetService<Service::AM::Module::Interface>("am:u");
     if (!am)
         return nullptr;

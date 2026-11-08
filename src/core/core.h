@@ -1,6 +1,6 @@
 // Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -12,6 +12,7 @@
 #include <boost/optional.hpp>
 #include <boost/serialization/version.hpp>
 #include "common/common_types.h"
+#include "common/thread.h"
 #include "common/vector_math.h"
 #include "core/arm/arm_interface.h"
 #include "core/cheats/cheats.h"
@@ -106,9 +107,10 @@ public:
         ErrorArticDisconnected,               ///< Error when artic base disconnects
         ErrorN3DSApplication,        ///< Error launching New 3DS application in Old 3DS mode
         ErrorCoreExceptionRaised,    ///< The CPU emulation raised an exception
-        ErrorMemoryExceptionRaised,  ///< Unmmaped memory was accessed
         ErrorSavestateBuildMismatch, ///< Tried to load savestate from a different Azahar version
         ShutdownRequested,           ///< Emulated program requested a system shutdown
+        ErrorShaderCacheCrash,       ///< The emulator crashed the last time it built the disk
+                                     ///< shader cache
         ErrorUnknown                 ///< Any other error
     };
 
@@ -126,6 +128,26 @@ public:
      * @return Result status, indicating whethor or not the operation succeeded.
      */
     [[nodiscard]] ResultStatus RunLoop(bool tight_loop = true);
+
+    /**
+     * Runs one pass of all the work that must happen on the emulation thread outside of guest
+     * execution (such as GDB or scripting requests). Called by RunLoop between slices and from
+     * the frame limiter.
+     */
+    void ProcessPendingWork();
+
+    /**
+     * Runs ProcessPendingWork until the deadline, sleeping in between until either the deadline
+     * passes or NotifyPendingWork is called. The frame limiter calls this instead of sleeping.
+     * Must be called from the emulation thread.
+     */
+    void ProcessPendingWorkUntil(std::chrono::steady_clock::time_point deadline);
+
+    /**
+     * Wakes up the emulation thread if it is waiting in ProcessPendingWorkUntil, so that newly
+     * queued work is processed right away. This function is thread safe.
+     */
+    void NotifyPendingWork();
 
     /**
      * Step the CPU one instruction
@@ -344,9 +366,14 @@ public:
     }
 
     /// Function for checking OS microphone permissions.
-
     void RegisterMicPermissionCheck(const std::function<bool()>& permission_func) {
         mic_permission_func = permission_func;
+    }
+
+    /// Fires the callback when System::Init() is called. Called with
+    /// true when initialization starts, and with false once its done.
+    void RegisterOnInitCallback(const std::function<void(bool)>& init_callback) {
+        on_init_callback = init_callback;
     }
 
     [[nodiscard]] bool HasMicPermission() {
@@ -426,6 +453,14 @@ public:
         override_gdb_port = port;
     }
 
+    void RegisterCoreLoopThreadId() {
+        core_loop_thread_id = std::this_thread::get_id();
+    }
+
+    std::thread::id GetCoreLoopThreadId() {
+        return core_loop_thread_id;
+    }
+
 private:
     /**
      * Initialize the emulated system.
@@ -440,6 +475,10 @@ private:
 
     /// Reschedule the core emulation
     void Reschedule();
+
+    /// Registers the bundle being run, if any, and scans the installed titles in AM. Done at boot
+    /// and after a savestate load, which creates AM again.
+    void LoadAMTitles();
 
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
@@ -500,6 +539,8 @@ private:
 private:
     static System s_instance;
 
+    Common::Event pending_work_event;
+
     std::atomic_bool is_powered_on{};
 
     SaveStateStatus save_state_status = SaveStateStatus::NONE;
@@ -524,6 +565,8 @@ private:
     std::function<bool()> mic_permission_func;
     bool mic_permission_granted = false;
 
+    std::function<void(bool)> on_init_callback;
+
     boost::optional<Service::APT::DeliverArg> restore_deliver_arg;
     boost::optional<Service::APT::SysMenuArg> restore_sys_menu_arg;
     boost::optional<Service::PLGLDR::PLG_LDR::PluginLoaderContext> restore_plugin_context;
@@ -537,6 +580,8 @@ private:
 
     bool debug_next_process;
     int override_gdb_port = -1;
+
+    std::thread::id core_loop_thread_id{};
 
     friend class boost::serialization::access;
     template <typename Archive>

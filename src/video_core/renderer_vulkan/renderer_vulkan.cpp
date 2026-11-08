@@ -1,6 +1,6 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -311,19 +311,23 @@ void RendererVulkan::CompileShaders() {
     cursor_fragment_shader =
         Compile(HostShaders::VULKAN_CURSOR_FRAG, vk::ShaderStageFlagBits::eFragment, device);
 
-    auto properties = instance.GetPhysicalDevice().getProperties();
     for (std::size_t i = 0; i < present_samplers.size(); i++) {
-        const vk::Filter filter_mode = i == 0 ? vk::Filter::eLinear : vk::Filter::eNearest;
+        const bool linear = i == 0;
+        const vk::Filter filter_mode = linear ? vk::Filter::eLinear : vk::Filter::eNearest;
+        const vk::SamplerMipmapMode mipmap_mode =
+            linear ? vk::SamplerMipmapMode::eLinear : vk::SamplerMipmapMode::eNearest;
         const vk::SamplerCreateInfo sampler_info = {
             .magFilter = filter_mode,
             .minFilter = filter_mode,
-            .mipmapMode = vk::SamplerMipmapMode::eLinear,
+            .mipmapMode = mipmap_mode,
             .addressModeU = vk::SamplerAddressMode::eClampToEdge,
             .addressModeV = vk::SamplerAddressMode::eClampToEdge,
-            .anisotropyEnable = instance.IsAnisotropicFilteringSupported(),
-            .maxAnisotropy = properties.limits.maxSamplerAnisotropy,
+            .anisotropyEnable = VK_FALSE,
+            .maxAnisotropy = 1.0f,
             .compareEnable = false,
             .compareOp = vk::CompareOp::eAlways,
+            .minLod = 0.0f,
+            .maxLod = 0.0f,
             .borderColor = vk::BorderColor::eIntOpaqueBlack,
             .unnormalizedCoordinates = false,
         };
@@ -1177,6 +1181,13 @@ void RendererVulkan::SwapBuffers() {
     system.perf_stats->EndSwap();
     rasterizer.TickFrame();
     EndFrame();
+}
+
+void RendererVulkan::LimitFramesAheadOfGpu() {
+    if (previous_game_frame_tick != 0) {
+        scheduler.Wait(previous_game_frame_tick);
+    }
+    previous_game_frame_tick = scheduler.CurrentTick() - 1;
 }
 
 void RendererVulkan::RenderScreenshot() {

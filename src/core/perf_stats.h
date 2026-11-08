@@ -1,6 +1,6 @@
 // Copyright 2017-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -96,6 +97,12 @@ public:
      */
     double GetMeanFrametime() const;
 
+    /// Gets the host time spent on the last system frame, without the frame limiter wait.
+    Clock::duration GetLastSystemFrameTime() const;
+
+    /// Gets the number of game frames since the emulation started.
+    u64 GetGameFrameCount() const;
+
     /**
      * Gets the ratio between walltime and the emulated time of the previous system frame. This is
      * useful for scaling inputs or outputs moving between the two time domains.
@@ -145,6 +152,8 @@ private:
     u32 system_frames = 0;
     /// Cumulative number of game frames (GSP frame submissions) since last reset
     u32 game_frames = 0;
+    /// Number of game frames since the emulation started, without resets.
+    u64 total_game_frames = 0;
     /// Cumulative number of transmitted artic base traffic
     std::atomic<u32> artic_transmitted = 0;
     // System events that affect performance
@@ -158,6 +167,8 @@ private:
     Clock::time_point frame_begin = reset_point;
     /// Total visible duration (including frame-limiting, etc.) of the previous system frame
     Clock::duration previous_frame_length = Clock::duration::zero();
+    /// Duration of the last system frame, from BeginSystemFrame to EndSystemFrame
+    Clock::duration last_system_frame_time = Clock::duration::zero();
     /// Visible duration for the frame prior to previous_frame_length
     Clock::duration previous_previous_frame_length = Clock::duration::zero();
 
@@ -193,7 +204,20 @@ public:
     void AdvanceFrame();
     void WaitOnce();
 
+    using WaitCallback = std::function<void(std::chrono::steady_clock::time_point deadline)>;
+
+    /**
+     * Sets a function the emulation thread calls instead of sleeping when the frame limiter
+     * blocks (frame limiting sleeps and frame advance waits). It must return at the deadline,
+     * and may do work on the emulation thread while waiting.
+     */
+    void SetWaitCallback(WaitCallback callback);
+
 private:
+    void WaitForFrameAdvance();
+
+    WaitCallback wait_callback;
+
     /// Emulated system time (in microseconds) at the last limiter invocation
     std::chrono::microseconds previous_system_time_us{0};
     /// Walltime at the last limiter invocation

@@ -1,6 +1,6 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <boost/container/static_vector.hpp>
 
@@ -163,18 +163,40 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     };
 
     const vk::PipelineMultisampleStateCreateInfo multisampling = {
-        .rasterizationSamples = vk::SampleCountFlagBits::e1,
-        .sampleShadingEnable = false,
+        .rasterizationSamples = vk::SampleCountFlagBits(info.state.attachments.sample_count),
+        .sampleShadingEnable = true,
+        .minSampleShading = 1.0f,
     };
 
+    const auto& blending = info.state.blending;
+    auto src_color_factor = PicaToVK::BlendFunc(blending.src_color_blend_factor);
+    auto dst_color_factor = PicaToVK::BlendFunc(blending.dst_color_blend_factor);
+    auto color_op = PicaToVK::BlendEquation(blending.color_blend_eq);
+    auto src_alpha_factor = PicaToVK::BlendFunc(blending.src_alpha_blend_factor);
+    auto dst_alpha_factor = PicaToVK::BlendFunc(blending.dst_alpha_blend_factor);
+    auto alpha_op = PicaToVK::BlendEquation(blending.alpha_blend_eq);
+
+    // Blending with min/max equations is emulated in the fragment shader so
+    // configure blending to not modify the incoming fragment color.
+    if (blending.rgb_blend_emulation) {
+        src_color_factor = vk::BlendFactor::eOne;
+        dst_color_factor = vk::BlendFactor::eZero;
+        color_op = vk::BlendOp::eAdd;
+    }
+    if (blending.alpha_blend_emulation) {
+        src_alpha_factor = vk::BlendFactor::eOne;
+        dst_alpha_factor = vk::BlendFactor::eZero;
+        alpha_op = vk::BlendOp::eAdd;
+    }
+
     const vk::PipelineColorBlendAttachmentState colorblend_attachment = {
-        .blendEnable = info.state.blending.blend_enable,
-        .srcColorBlendFactor = PicaToVK::BlendFunc(info.state.blending.src_color_blend_factor),
-        .dstColorBlendFactor = PicaToVK::BlendFunc(info.state.blending.dst_color_blend_factor),
-        .colorBlendOp = PicaToVK::BlendEquation(info.state.blending.color_blend_eq),
-        .srcAlphaBlendFactor = PicaToVK::BlendFunc(info.state.blending.src_alpha_blend_factor),
-        .dstAlphaBlendFactor = PicaToVK::BlendFunc(info.state.blending.dst_alpha_blend_factor),
-        .alphaBlendOp = PicaToVK::BlendEquation(info.state.blending.alpha_blend_eq),
+        .blendEnable = blending.blend_enable,
+        .srcColorBlendFactor = src_color_factor,
+        .dstColorBlendFactor = dst_color_factor,
+        .colorBlendOp = color_op,
+        .srcAlphaBlendFactor = src_alpha_factor,
+        .dstAlphaBlendFactor = dst_alpha_factor,
+        .alphaBlendOp = alpha_op,
         .colorWriteMask =
             static_cast<vk::ColorComponentFlags>(info.GetFinalColorWriteMask(instance)),
     };
@@ -275,7 +297,8 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
         .pDynamicState = &dynamic_info,
         .layout = pipeline_layout,
         .renderPass = renderpass_cache.GetRenderpass(info.state.attachments.color,
-                                                     info.state.attachments.depth, false),
+                                                     info.state.attachments.depth, false,
+                                                     info.state.attachments.sample_count),
     };
 
     if (fail_on_compile_required) {
